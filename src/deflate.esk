@@ -1,0 +1,664 @@
+// deflate.esk: raw DEFLATE compression (RFC 1951).
+//
+// Levels 0 to 9 as in zlib: 0 stores the data, 1 to 3 take the first match
+// found along a short hash chain, 4 to 9 search longer chains and defer each
+// match by one byte to see whether the next position has a longer one (lazy
+// matching). The window is the full 32 KB.
+//
+//     Bytes packed = deflate_raw(data, n, 6)?;
+//     defer packed.free();
+//
+// The matches are collected into blocks of 16384 symbols. Each block is
+// written in whichever form is smallest: stored, the fixed Huffman codes, or
+// codes built from the block's own symbol counts, limited to 15 bits.
+
+import <mem>;
+import <bytes>;
+import <result>;
+
+const int DEFLATE_STORE = 0;
+const int DEFLATE_FAST = 1;
+const int DEFLATE_DEFAULT = 6;
+const int DEFLATE_BEST = 9;
+
+// zlib's configuration table: chains shorten below a match of `good`, lazy
+// matching stops at a match of `lazy` (for levels 1 to 3 it is the longest
+// match whose positions are all hashed), the search stops at `nice`, and at
+// most `chain` candidates are tried.
+const int[10] _DEF_GOOD = {0, 4, 4, 4, 4, 8, 8, 8, 32, 32};
+const int[10] _DEF_LAZY = {0, 4, 5, 6, 4, 16, 16, 32, 128, 258};
+const int[10] _DEF_NICE = {0, 8, 16, 32, 16, 32, 128, 128, 258, 258};
+const int[10] _DEF_CHAIN = {0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096};
+
+const int _DEF_WSIZE = 32768;
+const int _DEF_WMASK = 32767;
+const int _DEF_HBITS = 15;
+const int _DEF_SYMS = 16384;
+
+const uint16[29] _DEF_LEN_BASE = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+const uint8[29] _DEF_LEN_EXTRA = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+const uint16[30] _DEF_DIST_BASE = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+const uint8[30] _DEF_DIST_EXTRA = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+const uint8[19] _DEF_CL_ORDER = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+// Symbol lookup tables, built on first use: _def_len_sym maps a match length
+// minus 3 to its length code (0 to 28), _def_dist_sym maps a distance minus 1
+// to its distance code (below 256 directly, above through distance >> 7).
+uint8[256] _def_len_sym;
+uint8[512] _def_dist_sym;
+uint16[288] _def_fix_lcode;
+uint8[288] _def_fix_llen;
+uint16[30] _def_fix_dcode;
+uint8[30] _def_fix_dlen;
+bool _def_ready = false;
+
+struct _Deflate {
+    *uint8 src;
+    uint64 len;
+    int level;
+    int good;
+    int lazy;
+    int nice;
+    int chain;
+    *int64 head;
+    *int64 prev;
+    *uint16 slit;
+    *uint16 sdist;
+    int nsym;
+    uint64 bstart;
+    uint64 blen;
+    int[286] lfreq;
+    int[30] dfreq;
+    Bytes* out;
+    uint64 bitbuf;
+    int bitcount;
+}
+
+// Reverses the low n bits of v (Huffman codes go out most significant bit first).
+int _def_rev(int v, int n) {
+    int r = 0;
+    int x = v;
+    for (i in 0..n) {
+        r = (r << 1) | (x & 1);
+        x = x >> 1;
+    }
+    return r;
+}
+
+// Assigns canonical codes to lengths, bit-reversed for the LSB-first writer.
+void _def_codes(*uint8 lens, int n, *uint16 codes) {
+    let count: int[16];
+    let next: int[16];
+    for (i in 0..n) count[(int)lens[i]]++;
+    count[0] = 0;
+    int code = 0;
+    for (b in 1..16) {
+        code = (code + count[b - 1]) << 1;
+        next[b] = code;
+    }
+    for (i in 0..n) {
+        int l = (int)lens[i];
+        if (l != 0) {
+            codes[i] = (uint16)_def_rev(next[l], l);
+            next[l]++;
+        } else {
+            codes[i] = 0;
+        }
+    }
+}
+
+void _def_tables() {
+    for (c in 0..28) {
+        int base = (int)_DEF_LEN_BASE[c] - 3;
+        for (k in 0..(1 << (int)_DEF_LEN_EXTRA[c])) _def_len_sym[base + k] = (uint8)c;
+    }
+    _def_len_sym[255] = 28;
+    for (c in 0..30) {
+        int base = (int)_DEF_DIST_BASE[c] - 1;
+        for (k in 0..(1 << (int)_DEF_DIST_EXTRA[c])) {
+            int d = base + k;
+            if (d < 256) {
+                _def_dist_sym[d] = (uint8)c;
+            } else {
+                _def_dist_sym[256 + (d >> 7)] = (uint8)c;
+            }
+        }
+    }
+    for (i in 0..144) _def_fix_llen[i] = 8;
+    for (i in 144..256) _def_fix_llen[i] = 9;
+    for (i in 256..280) _def_fix_llen[i] = 7;
+    for (i in 280..288) _def_fix_llen[i] = 8;
+    for (i in 0..30) _def_fix_dlen[i] = 5;
+    _def_codes(&_def_fix_llen[0], 288, &_def_fix_lcode[0]);
+    _def_codes(&_def_fix_dlen[0], 30, &_def_fix_dcode[0]);
+    _def_ready = true;
+}
+
+int _def_dcode(int dist) {
+    int d = dist - 1;
+    if (d < 256) return (int)_def_dist_sym[d];
+    return (int)_def_dist_sym[256 + (d >> 7)];
+}
+
+// ---- Huffman code lengths ----
+
+// Sorts the used symbols by count, ascending (ties by symbol), with a shell sort.
+void _def_sort(*int64 key, *int sym, int n) {
+    int gap = 1;
+    while (gap < n / 3) gap = gap * 3 + 1;
+    while (gap > 0) {
+        for (i in gap..n) {
+            int64 k = key[i];
+            int s = sym[i];
+            int j = i;
+            while (j >= gap && (key[j - gap] > k || (key[j - gap] == k && sym[j - gap] > s))) {
+                key[j] = key[j - gap];
+                sym[j] = sym[j - gap];
+                j -= gap;
+            }
+            key[j] = k;
+            sym[j] = s;
+        }
+        gap = gap / 3;
+    }
+}
+
+// Computes Huffman code lengths for counts freq[0..n) into lens, no longer
+// than maxbits. The optimal lengths come from Moffat and Katajainen's in-place
+// algorithm; lengths over the limit are then folded into it and the Kraft sum
+// repaired by lengthening the least frequent codes, as miniz does. At least two
+// symbols always get a code so that the code is complete.
+void _def_lengths(*int freq, int n, int maxbits, *uint8 lens) {
+    let a: int64[288];
+    let sym: int[288];
+    int m = 0;
+    for (i in 0..n) {
+        lens[i] = 0;
+        if (freq[i] > 0) {
+            a[m] = (int64)freq[i];
+            sym[m] = i;
+            m++;
+        }
+    }
+    if (m < 2) {
+        int s0 = m == 1 ? sym[0] : 0;
+        int s1 = s0 == 0 ? 1 : 0;
+        lens[s0] = 1;
+        lens[s1] = 1;
+        return;
+    }
+    _def_sort(&a[0], &sym[0], m);
+    a[0] += a[1];
+    int root = 0;
+    int leaf = 2;
+    for (next in 1..m - 1) {
+        if (leaf >= m || a[root] < a[leaf]) {
+            a[next] = a[root];
+            a[root] = (int64)next;
+            root++;
+        } else {
+            a[next] = a[leaf];
+            leaf++;
+        }
+        if (leaf >= m || (root < next && a[root] < a[leaf])) {
+            a[next] = a[next] + a[root];
+            a[root] = (int64)next;
+            root++;
+        } else {
+            a[next] = a[next] + a[leaf];
+            leaf++;
+        }
+    }
+    a[m - 2] = 0;
+    int nx = m - 3;
+    while (nx >= 0) {
+        a[nx] = a[(int)a[nx]] + 1;
+        nx--;
+    }
+    int avbl = 1;
+    int used = 0;
+    int64 dpth = 0;
+    root = m - 2;
+    nx = m - 1;
+    while (avbl > 0) {
+        while (root >= 0 && a[root] == dpth) {
+            used++;
+            root--;
+        }
+        while (avbl > used) {
+            a[nx] = dpth;
+            nx--;
+            avbl--;
+        }
+        avbl = 2 * used;
+        dpth++;
+        used = 0;
+    }
+    let num: int[16];
+    for (i in 0..m) {
+        int64 l = a[i];
+        if (l > (int64)maxbits) l = (int64)maxbits;
+        num[(int)l]++;
+    }
+    int64 total = 0;
+    for (i in 1..maxbits + 1) total += (int64)num[i] << (maxbits - i);
+    while (total != ((int64)1 << maxbits)) {
+        num[maxbits]--;
+        int i = maxbits - 1;
+        while (i > 0) {
+            if (num[i] != 0) {
+                num[i]--;
+                num[i + 1] += 2;
+                break;
+            }
+            i--;
+        }
+        total--;
+    }
+    int j = m;
+    for (i in 1..maxbits + 1) {
+        for (k in 0..num[i]) {
+            j--;
+            lens[sym[j]] = (uint8)i;
+        }
+    }
+}
+
+// ---- bit output ----
+
+void _def_put(*_Deflate z, int v, int n) {
+    z.bitbuf = z.bitbuf | ((uint64)v << z.bitcount);
+    z.bitcount += n;
+    if (z.bitcount >= 32) {
+        Bytes* o = z.out;
+        *uint8 p = o.data + o.len;
+        p[0] = (uint8)z.bitbuf;
+        p[1] = (uint8)(z.bitbuf >> 8);
+        p[2] = (uint8)(z.bitbuf >> 16);
+        p[3] = (uint8)(z.bitbuf >> 24);
+        o.len += 4;
+        z.bitbuf = z.bitbuf >> 32;
+        z.bitcount -= 32;
+    }
+}
+
+// Writes out the bits still buffered, padding the last byte with zeros.
+void _def_align(*_Deflate z) {
+    Bytes* o = z.out;
+    while (z.bitcount > 0) {
+        o.data[o.len] = (uint8)z.bitbuf;
+        o.len++;
+        z.bitbuf = z.bitbuf >> 8;
+        z.bitcount -= 8;
+    }
+    z.bitbuf = 0;
+    z.bitcount = 0;
+}
+
+// Stored blocks for src[start..start+n), at most 65535 bytes each.
+void _def_stored(*_Deflate z, uint64 start, uint64 n, bool last) {
+    uint64 off = 0;
+    while (true) {
+        uint64 k = n - off;
+        if (k > 65535) k = 65535;
+        bool fin = last && off + k == n;
+        Bytes* o = z.out;
+        o.reserve((int64)k + 16);
+        _def_put(z, fin ? 1 : 0, 3);
+        _def_align(z);
+        *uint8 p = o.data + o.len;
+        int kk = (int)k;
+        p[0] = (uint8)kk;
+        p[1] = (uint8)(kk >> 8);
+        p[2] = (uint8)~kk;
+        p[3] = (uint8)(~kk >> 8);
+        if (k > 0) memcpy((*void)(p + 4), (*void)(z.src + start + off), (int64)k);
+        o.len += (int64)k + 4;
+        off += k;
+        if (off >= n) break;
+    }
+}
+
+void _def_symbols(*_Deflate z, *uint16 lcode, *uint8 llen, *uint16 dcode, *uint8 dlen) {
+    for (i in 0..z.nsym) {
+        int d = (int)z.sdist[i];
+        int v = (int)z.slit[i];
+        if (d == 0) {
+            _def_put(z, (int)lcode[v], (int)llen[v]);
+            continue;
+        }
+        int lc = (int)_def_len_sym[v];
+        _def_put(z, (int)lcode[257 + lc], (int)llen[257 + lc]);
+        int e = (int)_DEF_LEN_EXTRA[lc];
+        if (e != 0) _def_put(z, v + 3 - (int)_DEF_LEN_BASE[lc], e);
+        int dc = _def_dcode(d);
+        _def_put(z, (int)dcode[dc], (int)dlen[dc]);
+        e = (int)_DEF_DIST_EXTRA[dc];
+        if (e != 0) _def_put(z, d - (int)_DEF_DIST_BASE[dc], e);
+    }
+    _def_put(z, (int)lcode[256], (int)llen[256]);
+}
+
+// Writes the block collected so far in its smallest form.
+void _def_flush(*_Deflate z, bool last) {
+    z.lfreq[256] = 1;
+    let llen: uint8[286];
+    let dlen: uint8[30];
+    _def_lengths(&z.lfreq[0], 286, 15, &llen[0]);
+    _def_lengths(&z.dfreq[0], 30, 15, &dlen[0]);
+    int hlit = 286;
+    while (hlit > 257 && llen[hlit - 1] == 0) hlit--;
+    int hdist = 30;
+    while (hdist > 1 && dlen[hdist - 1] == 0) hdist--;
+
+    // Run-length code the two length sequences together.
+    let all: uint8[316];
+    for (i in 0..hlit) all[i] = llen[i];
+    for (i in 0..hdist) all[hlit + i] = dlen[i];
+    int total = hlit + hdist;
+    let rsym: uint8[316];
+    let rext: uint8[316];
+    int nr = 0;
+    let clfreq: int[19];
+    int i = 0;
+    while (i < total) {
+        int l = (int)all[i];
+        int run = 1;
+        while (i + run < total && (int)all[i + run] == l) run++;
+        i += run;
+        if (l == 0) {
+            while (run >= 11) {
+                int r = run > 138 ? 138 : run;
+                rsym[nr] = 18;
+                rext[nr] = (uint8)(r - 11);
+                nr++;
+                run -= r;
+            }
+            if (run >= 3) {
+                rsym[nr] = 17;
+                rext[nr] = (uint8)(run - 3);
+                nr++;
+                run = 0;
+            }
+        } else {
+            rsym[nr] = (uint8)l;
+            nr++;
+            run--;
+            while (run >= 3) {
+                int r = run > 6 ? 6 : run;
+                rsym[nr] = 16;
+                rext[nr] = (uint8)(r - 3);
+                nr++;
+                run -= r;
+            }
+        }
+        while (run > 0) {
+            rsym[nr] = (uint8)l;
+            nr++;
+            run--;
+        }
+    }
+    for (k in 0..nr) clfreq[(int)rsym[k]]++;
+    let cllen: uint8[19];
+    _def_lengths(&clfreq[0], 19, 7, &cllen[0]);
+    int hclen = 19;
+    while (hclen > 4 && cllen[(int)_DEF_CL_ORDER[hclen - 1]] == 0) hclen--;
+
+    int64 extra = 0;
+    int64 dyn = 3 + 14 + 3 * (int64)hclen;
+    int64 fix = 3;
+    for (k in 0..19) dyn += (int64)clfreq[k] * (int64)cllen[k];
+    dyn += (int64)clfreq[16] * 2 + (int64)clfreq[17] * 3 + (int64)clfreq[18] * 7;
+    for (k in 0..286) {
+        int64 f = (int64)z.lfreq[k];
+        if (f == 0) continue;
+        dyn += f * (int64)llen[k];
+        fix += f * (int64)_def_fix_llen[k];
+        if (k >= 257) extra += f * (int64)_DEF_LEN_EXTRA[k - 257];
+    }
+    for (k in 0..30) {
+        int64 f = (int64)z.dfreq[k];
+        if (f == 0) continue;
+        dyn += f * (int64)dlen[k];
+        fix += f * 5;
+        extra += f * (int64)_DEF_DIST_EXTRA[k];
+    }
+    dyn += extra;
+    fix += extra;
+    int64 chunks = (int64)(z.blen / 65535) + 1;
+    int64 stored = (int64)z.blen * 8 + chunks * 48;
+    int64 best = dyn < fix ? dyn : fix;
+
+    if (stored < best) {
+        z.out.reserve(stored / 8 + 16);
+        _def_stored(z, z.bstart, z.blen, last);
+    } else {
+        z.out.reserve(best / 8 + 16);
+        if (fix <= dyn) {
+            _def_put(z, last ? 3 : 2, 3);
+            _def_symbols(z, &_def_fix_lcode[0], &_def_fix_llen[0], &_def_fix_dcode[0], &_def_fix_dlen[0]);
+        } else {
+            let lcode: uint16[286];
+            let dcode: uint16[30];
+            let clcode: uint16[19];
+            _def_codes(&llen[0], 286, &lcode[0]);
+            _def_codes(&dlen[0], 30, &dcode[0]);
+            _def_codes(&cllen[0], 19, &clcode[0]);
+            _def_put(z, last ? 5 : 4, 3);
+            _def_put(z, hlit - 257, 5);
+            _def_put(z, hdist - 1, 5);
+            _def_put(z, hclen - 4, 4);
+            for (k in 0..hclen) _def_put(z, (int)cllen[(int)_DEF_CL_ORDER[k]], 3);
+            for (k in 0..nr) {
+                int s = (int)rsym[k];
+                _def_put(z, (int)clcode[s], (int)cllen[s]);
+                if (s == 16) _def_put(z, (int)rext[k], 2);
+                if (s == 17) _def_put(z, (int)rext[k], 3);
+                if (s == 18) _def_put(z, (int)rext[k], 7);
+            }
+            _def_symbols(z, &lcode[0], &llen[0], &dcode[0], &dlen[0]);
+        }
+    }
+    z.bstart += z.blen;
+    z.blen = 0;
+    z.nsym = 0;
+    memset((*void)&z.lfreq[0], 0, 286 * 4);
+    memset((*void)&z.dfreq[0], 0, 30 * 4);
+}
+
+void _def_literal(*_Deflate z, int c) {
+    z.slit[z.nsym] = (uint16)c;
+    z.sdist[z.nsym] = 0;
+    z.nsym++;
+    z.lfreq[c]++;
+    z.blen++;
+    if (z.nsym == _DEF_SYMS) _def_flush(z, false);
+}
+
+void _def_match(*_Deflate z, int dist, int length) {
+    z.slit[z.nsym] = (uint16)(length - 3);
+    z.sdist[z.nsym] = (uint16)dist;
+    z.nsym++;
+    z.lfreq[257 + (int)_def_len_sym[length - 3]]++;
+    z.dfreq[_def_dcode(dist)]++;
+    z.blen += (uint64)length;
+    if (z.nsym == _DEF_SYMS) _def_flush(z, false);
+}
+
+// ---- match finding ----
+
+int _def_hash(*uint8 p) {
+    uint32 v = (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16);
+    return (int)((v * (uint32)2654435761) >> (32 - _DEF_HBITS));
+}
+
+// Hashes the 3 bytes at pos into the chains; returns the previous position
+// with the same hash, or -1.
+int64 _def_insert(*_Deflate z, uint64 pos) {
+    int h = _def_hash(z.src + pos);
+    int64 old = z.head[h];
+    z.prev[(int)(pos & (uint64)_DEF_WMASK)] = old;
+    z.head[h] = (int64)pos + 1;
+    return old - 1;
+}
+
+// Follows the chain from cand looking for a match longer than best at pos.
+// Returns the longest length found (best when none is longer) and sets *start.
+int _def_longest(*_Deflate z, uint64 pos, int64 cand, int best, *int64 start) {
+    int maxlen = 258;
+    if (z.len - pos < 258) maxlen = (int)(z.len - pos);
+    if (best >= maxlen) return best;
+    int nice = z.nice < maxlen ? z.nice : maxlen;
+    int chain = z.chain;
+    if (best >= z.good) chain = chain >> 2;
+    int64 lowest = (int64)pos - (int64)_DEF_WSIZE;
+    *uint8 scan = z.src + pos;
+    int64 c = cand;
+    while (c >= 0 && c >= lowest && chain > 0) {
+        chain--;
+        *uint8 m = z.src + c;
+        if (m[best] == scan[best] && m[best - 1] == scan[best - 1] && m[0] == scan[0] && m[1] == scan[1]) {
+            int l = 2;
+            while (l < maxlen && m[l] == scan[l]) l++;
+            if (l > best) {
+                best = l;
+                *start = c;
+                if (l >= nice) break;
+            }
+        }
+        int64 nx = z.prev[(int)(c & (int64)_DEF_WMASK)] - 1;
+        if (nx >= c) break;
+        c = nx;
+    }
+    return best;
+}
+
+// Levels 1 to 3: take the match found at each position.
+void _def_greedy(*_Deflate z) {
+    uint64 n = z.len;
+    uint64 pos = 0;
+    while (pos < n) {
+        int mlen = 0;
+        int64 ms = 0;
+        if (n - pos >= 3) {
+            int64 cand = _def_insert(z, pos);
+            if (cand >= 0 && pos - (uint64)cand <= (uint64)_DEF_WSIZE) mlen = _def_longest(z, pos, cand, 2, &ms);
+        }
+        if (mlen >= 3) {
+            _def_match(z, (int)(pos - (uint64)ms), mlen);
+            if (mlen <= z.lazy) {
+                for (k in 1..mlen) {
+                    uint64 p = pos + (uint64)k;
+                    if (n - p >= 3) _def_insert(z, p);
+                }
+            }
+            pos += (uint64)mlen;
+        } else {
+            _def_literal(z, (int)z.src[pos]);
+            pos++;
+        }
+    }
+}
+
+// Levels 4 to 9: a match is emitted only when the next position does not
+// start a longer one.
+void _def_lazy(*_Deflate z) {
+    uint64 n = z.len;
+    uint64 pos = 0;
+    int mlen = 2;
+    int64 ms = 0;
+    bool avail = false;
+    while (pos < n) {
+        int64 cand = -1;
+        if (n - pos >= 3) cand = _def_insert(z, pos);
+        int plen = mlen;
+        int64 pms = ms;
+        mlen = 2;
+        if (cand >= 0 && plen < z.lazy && pos - (uint64)cand <= (uint64)_DEF_WSIZE) {
+            mlen = _def_longest(z, pos, cand, plen, &ms);
+            if (mlen <= plen) {
+                mlen = 2;
+            } else if (mlen == 3 && pos - (uint64)ms > 4096) {
+                mlen = 2;
+            }
+        }
+        if (plen >= 3 && mlen <= plen) {
+            _def_match(z, (int)(pos - 1 - (uint64)pms), plen);
+            uint64 end = pos - 1 + (uint64)plen;
+            uint64 p = pos + 1;
+            while (p < end) {
+                if (n - p >= 3) _def_insert(z, p);
+                p++;
+            }
+            pos = end;
+            avail = false;
+            mlen = 2;
+        } else if (avail) {
+            _def_literal(z, (int)z.src[pos - 1]);
+            pos++;
+        } else {
+            avail = true;
+            pos++;
+        }
+    }
+    if (avail) _def_literal(z, (int)z.src[pos - 1]);
+}
+
+// Compresses src[0..len) at the given level (clamped to 0..9) and appends the
+// raw DEFLATE stream to out.
+Result<int, string> deflate_raw_append(*uint8 src, uint64 len, int level, Bytes* out) {
+    if (!_def_ready) _def_tables();
+    int lv = level < 0 ? 0 : (level > 9 ? 9 : level);
+    if (out.cap == 0) out.init(64);
+    *_Deflate z = alloc<_Deflate>(1);
+    if (z == null) return Err<int, string>("deflate: out of memory");
+    defer free((*void)z);
+    z.src = src;
+    z.len = len;
+    z.level = lv;
+    z.out = out;
+    if (lv == 0) {
+        _def_stored(z, 0, len, true);
+        _def_align(z);
+        return Ok<int, string>(0);
+    }
+    z.good = _DEF_GOOD[lv];
+    z.lazy = _DEF_LAZY[lv];
+    z.nice = _DEF_NICE[lv];
+    z.chain = _DEF_CHAIN[lv];
+    z.head = alloc<int64>(1 << _DEF_HBITS);
+    z.prev = alloc<int64>(_DEF_WSIZE);
+    z.slit = alloc<uint16>(_DEF_SYMS);
+    z.sdist = alloc<uint16>(_DEF_SYMS);
+    defer free((*void)z.head);
+    defer free((*void)z.prev);
+    defer free((*void)z.slit);
+    defer free((*void)z.sdist);
+    if (z.head == null || z.prev == null || z.slit == null || z.sdist == null) return Err<int, string>("deflate: out of memory");
+    if (lv <= 3) {
+        _def_greedy(z);
+    } else {
+        _def_lazy(z);
+    }
+    _def_flush(z, true);
+    out.reserve(16);
+    _def_align(z);
+    return Ok<int, string>(0);
+}
+
+// Compresses src[0..len) into a new Bytes holding a raw DEFLATE stream.
+Result<Bytes, string> deflate_raw(*uint8 src, uint64 len, int level) {
+    let out: Bytes;
+    out.init((int64)(len / 2) + 64);
+    Result<int, string> r = deflate_raw_append(src, len, level, &out);
+    if (!r.ok) {
+        out.free();
+        return Err<Bytes, string>(r.error);
+    }
+    return Ok<Bytes, string>(out);
+}
+
+// An upper bound on the compressed size of len bytes at any level.
+uint64 deflate_bound(uint64 len) {
+    return len + (len / 65535 + 1) * 5 + 64;
+}
