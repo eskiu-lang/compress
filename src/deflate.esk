@@ -5,8 +5,8 @@
 // match by one byte to see whether the next position has a longer one (lazy
 // matching). The window is the full 32 KB.
 //
-//     Bytes packed = deflate_raw(data, n, 6)?;
-//     defer packed.free();
+//     Bytes comp = deflate_raw(data, n, 6)?;
+//     defer comp.free();
 //
 // The matches are collected into blocks of 16384 symbols. Each block is
 // written in whichever form is smallest: stored, the fixed Huffman codes, or
