@@ -15,6 +15,7 @@
 import <mem>;
 import <bytes>;
 import <result>;
+import <atomic>;
 
 const int DEFLATE_STORE = 0;
 const int DEFLATE_FAST = 1;
@@ -44,13 +45,15 @@ const uint8[19] _DEF_CL_ORDER = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3,
 // Symbol lookup tables, built on first use: _def_len_sym maps a match length
 // minus 3 to its length code (0 to 28), _def_dist_sym maps a distance minus 1
 // to its distance code (below 256 directly, above through distance >> 7).
+// As with the CRC tables, a thread that comes in while another builds them
+// waits for it.
 uint8[256] _def_len_sym;
 uint8[512] _def_dist_sym;
 uint16[288] _def_fix_lcode;
 uint8[288] _def_fix_llen;
 uint16[30] _def_fix_dcode;
 uint8[30] _def_fix_dlen;
-bool _def_ready = false;
+int _def_state = 0;
 
 struct _Deflate {
     *uint8 src;
@@ -108,6 +111,10 @@ void _def_codes(*uint8 lens, int n, *uint16 codes) {
 }
 
 void _def_tables() {
+    if (!atomic_cas(&_def_state, 0, 1)) {
+        while (atomic_load(&_def_state) != 2) {}
+        return;
+    }
     for (c in 0..28) {
         int base = (int)_DEF_LEN_BASE[c] - 3;
         for (k in 0..(1 << (int)_DEF_LEN_EXTRA[c])) _def_len_sym[base + k] = (uint8)c;
@@ -131,7 +138,7 @@ void _def_tables() {
     for (i in 0..30) _def_fix_dlen[i] = 5;
     _def_codes(&_def_fix_llen[0], 288, &_def_fix_lcode[0]);
     _def_codes(&_def_fix_dlen[0], 30, &_def_fix_dcode[0]);
-    _def_ready = true;
+    atomic_store(&_def_state, 2);
 }
 
 int _def_dcode(int dist) {
@@ -632,7 +639,7 @@ void _def_lazy(*_Deflate z) {
 // Compresses src[0..len) at the given level (clamped to 0..9) and appends the
 // raw DEFLATE stream to out.
 Result<int, string> deflate_raw_append(*uint8 src, uint64 len, int level, Bytes* out) {
-    if (!_def_ready) _def_tables();
+    if (atomic_load(&_def_state) != 2) _def_tables();
     int lv = level < 0 ? 0 : (level > 9 ? 9 : level);
     if (out.cap == 0) out.init(64);
     *_Deflate z = alloc<_Deflate>(1);

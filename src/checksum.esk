@@ -8,15 +8,22 @@
 //
 // The incremental forms start from 0 for CRC-32 and 1 for Adler-32, as zlib's
 // crc32() and adler32() do. CRC-32 reads 8 bytes per step through eight
-// 256-entry tables (slicing-by-8), built on first use.
+// 256-entry tables (slicing-by-8), built on first use; a thread that comes in
+// while another builds them waits for it.
+
+import <atomic>;
 
 const uint32 CRC32_INIT = 0;
 const uint32 ADLER32_INIT = 1;
 
 uint32[2048] _crc_tab;
-bool _crc_ready = false;
+int _crc_state = 0;
 
 void _crc_init() {
+    if (!atomic_cas(&_crc_state, 0, 1)) {
+        while (atomic_load(&_crc_state) != 2) {}
+        return;
+    }
     for (n in 0..256) {
         uint32 c = (uint32)n;
         for (k in 0..8) {
@@ -35,12 +42,12 @@ void _crc_init() {
             _crc_tab[k * 256 + n] = c;
         }
     }
-    _crc_ready = true;
+    atomic_store(&_crc_state, 2);
 }
 
 // Continues a CRC-32 over n more bytes. crc is 0 for the first piece.
 uint32 crc32_update(uint32 crc, *uint8 p, uint64 n) {
-    if (!_crc_ready) _crc_init();
+    if (atomic_load(&_crc_state) != 2) _crc_init();
     uint32 c = ~crc;
     uint64 i = 0;
     while (n - i >= 8) {
