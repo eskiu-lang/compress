@@ -1,0 +1,214 @@
+// gzip.esk: the gzip format (RFC 1952), a header, a DEFLATE stream, and the
+// CRC-32 and size of the data.
+//
+//     Bytes gz = gzip_compress(data, n, 6)?;
+//     GzipOptions o = GzipOptions{level: 9, name: "notes.txt", mtime: 1700000000};
+//     Bytes named = gzip_compress_with(data, n, &o)?;
+//     Bytes back = gzip_decompress(gz.data, (uint64)gz.len)?;
+//
+// Decompression joins every member of a multi-member file (what `cat a.gz
+// b.gz` makes) and checks each one's CRC-32 and size. Zero bytes after the
+// last member are ignored, as gzip(1) does; anything else is an error.
+// gzip_header reads the first member's file name, comment and time.
+
+import <mem>;
+import <bytes>;
+import <string>;
+import <result>;
+import <compress/checksum>;
+import <compress/inflate>;
+import <compress/deflate>;
+
+const int GZIP_OS_UNKNOWN = 255;
+
+// What gzip_compress_with writes into the header: name (or null for none)
+// and mtime (Unix seconds, 0 for none) are optional.
+struct GzipOptions {
+    int level;
+    string name;
+    string comment;
+    uint32 mtime;
+}
+
+// A member header as read by gzip_header. name and comment are empty when the
+// header has none; size is the header's length in bytes.
+struct GzipHeader {
+    String name;
+    String comment;
+    uint32 mtime;
+    int xfl;
+    int os;
+    bool text;
+    uint64 size;
+}
+
+void GzipHeader_free(GzipHeader* self) {
+    String_free(&self.name);
+    String_free(&self.comment);
+}
+
+uint32 _gz_le32(*uint8 p) {
+    return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+void _gz_put32(Bytes* b, uint32 v) {
+    b.push((uint8)v);
+    b.push((uint8)(v >> 8));
+    b.push((uint8)(v >> 16));
+    b.push((uint8)(v >> 24));
+}
+
+// Finds the NUL that ends a string field starting at off; returns its index or
+// -1 when the input ends first.
+int64 _gz_zstr(*uint8 src, uint64 len, uint64 off) {
+    uint64 i = off;
+    while (i < len) {
+        if (src[i] == 0) return (int64)i;
+        i++;
+    }
+    return -1;
+}
+
+// Parses a member header, filling out (when not null). Returns the header length.
+Result<uint64, string> _gz_parse(*uint8 src, uint64 len, GzipHeader* out) {
+    if (len < 10) return Err<uint64, string>("gzip: truncated");
+    if (src[0] != 0x1f || src[1] != 0x8b) return Err<uint64, string>("gzip: not a gzip file");
+    if (src[2] != 8) return Err<uint64, string>("gzip: unknown compression method");
+    int flg = (int)src[3];
+    if ((flg & 0xE0) != 0) return Err<uint64, string>("gzip: reserved flags set");
+    uint64 off = 10;
+    if ((flg & 4) != 0) {
+        if (len - off < 2) return Err<uint64, string>("gzip: truncated");
+        uint64 xlen = (uint64)src[off] | ((uint64)src[off + 1] << 8);
+        off += 2;
+        if (len - off < xlen) return Err<uint64, string>("gzip: truncated");
+        off += xlen;
+    }
+    int64 name_at = -1;
+    if ((flg & 8) != 0) {
+        int64 z = _gz_zstr(src, len, off);
+        if (z < 0) return Err<uint64, string>("gzip: truncated");
+        name_at = (int64)off;
+        off = (uint64)z + 1;
+    }
+    int64 comment_at = -1;
+    if ((flg & 16) != 0) {
+        int64 z = _gz_zstr(src, len, off);
+        if (z < 0) return Err<uint64, string>("gzip: truncated");
+        comment_at = (int64)off;
+        off = (uint64)z + 1;
+    }
+    if ((flg & 2) != 0) {
+        if (len - off < 2) return Err<uint64, string>("gzip: truncated");
+        uint32 want = (uint32)src[off] | ((uint32)src[off + 1] << 8);
+        if ((crc32(src, off) & 0xFFFF) != want) return Err<uint64, string>("gzip: header checksum mismatch");
+        off += 2;
+    }
+    if (out != null) {
+        out.name.init(16);
+        out.comment.init(16);
+        if (name_at >= 0) out.name.append((string)(src + name_at));
+        if (comment_at >= 0) out.comment.append((string)(src + comment_at));
+        out.mtime = _gz_le32(src + 4);
+        out.xfl = (int)src[8];
+        out.os = (int)src[9];
+        out.text = (flg & 1) != 0;
+        out.size = off;
+    }
+    return Ok<uint64, string>(off);
+}
+
+// Reads the header of the first member. Free the result with GzipHeader_free.
+Result<GzipHeader, string> gzip_header(*uint8 src, uint64 len) {
+    let h: GzipHeader;
+    Result<uint64, string> r = _gz_parse(src, len, &h);
+    if (!r.ok) return Err<GzipHeader, string>(r.error);
+    return Ok<GzipHeader, string>(h);
+}
+
+// Compresses src[0..len) into a single-member gzip file with the given header fields.
+Result<Bytes, string> gzip_compress_with(*uint8 src, uint64 len, GzipOptions* o) {
+    int lv = o.level < 0 ? 0 : (o.level > 9 ? 9 : o.level);
+    let out: Bytes;
+    out.init((int64)(len / 2) + 64);
+    int flg = 0;
+    if (o.name != null) flg = flg | 8;
+    if (o.comment != null) flg = flg | 16;
+    out.push(0x1f);
+    out.push(0x8b);
+    out.push(8);
+    out.push((uint8)flg);
+    _gz_put32(&out, o.mtime);
+    out.push(lv == 9 ? 2 : (lv == 1 ? 4 : 0));
+    out.push((uint8)GZIP_OS_UNKNOWN);
+    if (o.name != null) out.append_raw((*uint8)o.name, strlen(o.name) + 1);
+    if (o.comment != null) out.append_raw((*uint8)o.comment, strlen(o.comment) + 1);
+    Result<int, string> r = deflate_raw_append(src, len, lv, &out);
+    if (!r.ok) {
+        out.free();
+        return Err<Bytes, string>(r.error);
+    }
+    _gz_put32(&out, crc32(src, len));
+    _gz_put32(&out, (uint32)len);
+    return Ok<Bytes, string>(out);
+}
+
+// Compresses src[0..len) into a gzip file with no name and no time.
+Result<Bytes, string> gzip_compress(*uint8 src, uint64 len, int level) {
+    GzipOptions o = GzipOptions{level: level};
+    return gzip_compress_with(src, len, &o);
+}
+
+// Decompresses every member of a gzip file into a new Bytes of at most limit bytes.
+Result<Bytes, string> gzip_decompress_limit(*uint8 src, uint64 len, uint64 limit) {
+    let out: Bytes;
+    int64 guess = (int64)len * 4;
+    if (guess > (int64)limit) guess = (int64)limit;
+    if (guess > 67108864) guess = 67108864;
+    out.init(guess + 1);
+    uint64 off = 0;
+    while (true) {
+        Result<uint64, string> h = _gz_parse(src + off, len - off, null);
+        if (!h.ok) {
+            out.free();
+            return Err<Bytes, string>(h.error);
+        }
+        off += h.value;
+        int64 start = out.len;
+        Result<uint64, string> r = inflate_raw_append(src + off, len - off, &out, limit);
+        if (!r.ok) {
+            out.free();
+            return Err<Bytes, string>(r.error);
+        }
+        off += r.value;
+        if (len - off < 8) {
+            out.free();
+            return Err<Bytes, string>("gzip: truncated");
+        }
+        uint64 n = (uint64)(out.len - start);
+        if (_gz_le32(src + off) != crc32(out.data + start, n)) {
+            out.free();
+            return Err<Bytes, string>("gzip: checksum mismatch");
+        }
+        if (_gz_le32(src + off + 4) != (uint32)n) {
+            out.free();
+            return Err<Bytes, string>("gzip: size mismatch");
+        }
+        off += 8;
+        if (off == len) break;
+        if (len - off >= 2 && src[off] == 0x1f && src[off + 1] == 0x8b) continue;
+        for (uint64 i = off; i < len; i++) {
+            if (src[i] != 0) {
+                out.free();
+                return Err<Bytes, string>("gzip: trailing garbage");
+            }
+        }
+        break;
+    }
+    return Ok<Bytes, string>(out);
+}
+
+// Decompresses a gzip file into a new Bytes of at most INFLATE_DEFAULT_LIMIT bytes.
+Result<Bytes, string> gzip_decompress(*uint8 src, uint64 len) {
+    return gzip_decompress_limit(src, len, INFLATE_DEFAULT_LIMIT);
+}

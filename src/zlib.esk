@@ -1,0 +1,105 @@
+// zlib.esk: the zlib format (RFC 1950), a DEFLATE stream between a 2-byte
+// header and an Adler-32 of the data.
+//
+//     Bytes z = zlib_compress(data, n, 6)?;
+//     defer z.free();
+//     Bytes back = zlib_decompress(z.data, (uint64)z.len)?;
+//     defer back.free();
+//
+// Decompression checks the header and the Adler-32 and stops at the end of
+// the stream; bytes after it are ignored, as zlib's uncompress() does. Streams
+// that need a preset dictionary are rejected.
+
+import <mem>;
+import <bytes>;
+import <result>;
+import <compress/checksum>;
+import <compress/inflate>;
+import <compress/deflate>;
+
+// Checks the 2-byte header.
+string _zlib_header(*uint8 src, uint64 len) {
+    if (len < 2) return "zlib: truncated";
+    int cmf = (int)src[0];
+    int flg = (int)src[1];
+    if ((cmf & 15) != 8 || (cmf >> 4) > 7 || (cmf * 256 + flg) % 31 != 0) return "zlib: bad header";
+    if ((flg & 32) != 0) return "zlib: preset dictionary not supported";
+    return null;
+}
+
+uint32 _zlib_be32(*uint8 p) {
+    return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+// Compresses src[0..len) into a zlib stream at a level from 0 to 9.
+Result<Bytes, string> zlib_compress(*uint8 src, uint64 len, int level) {
+    int lv = level < 0 ? 0 : (level > 9 ? 9 : level);
+    let out: Bytes;
+    out.init((int64)(len / 2) + 64);
+    int flevel = 0;
+    if (lv >= 2) flevel = 1;
+    if (lv == 6) flevel = 2;
+    if (lv >= 7) flevel = 3;
+    int cmf = 0x78;
+    int flg = flevel << 6;
+    flg += 31 - (cmf * 256 + flg) % 31;
+    out.push((uint8)cmf);
+    out.push((uint8)flg);
+    Result<int, string> r = deflate_raw_append(src, len, lv, &out);
+    if (!r.ok) {
+        out.free();
+        return Err<Bytes, string>(r.error);
+    }
+    uint32 a = adler32(src, len);
+    out.push((uint8)(a >> 24));
+    out.push((uint8)(a >> 16));
+    out.push((uint8)(a >> 8));
+    out.push((uint8)a);
+    return Ok<Bytes, string>(out);
+}
+
+// Decompresses a zlib stream into a new Bytes of at most limit bytes.
+Result<Bytes, string> zlib_decompress_limit(*uint8 src, uint64 len, uint64 limit) {
+    string e = _zlib_header(src, len);
+    if (e != null) return Err<Bytes, string>(e);
+    let out: Bytes;
+    int64 guess = (int64)len * 4;
+    if (guess > (int64)limit) guess = (int64)limit;
+    if (guess > 67108864) guess = 67108864;
+    out.init(guess + 1);
+    Result<uint64, string> r = inflate_raw_append(src + 2, len - 2, &out, limit);
+    if (!r.ok) {
+        out.free();
+        return Err<Bytes, string>(r.error);
+    }
+    uint64 end = 2 + r.value;
+    if (len - end < 4) {
+        out.free();
+        return Err<Bytes, string>("zlib: truncated");
+    }
+    if (_zlib_be32(src + end) != adler32(out.data, (uint64)out.len)) {
+        out.free();
+        return Err<Bytes, string>("zlib: checksum mismatch");
+    }
+    return Ok<Bytes, string>(out);
+}
+
+// Decompresses a zlib stream into a new Bytes of at most INFLATE_DEFAULT_LIMIT bytes.
+Result<Bytes, string> zlib_decompress(*uint8 src, uint64 len) {
+    return zlib_decompress_limit(src, len, INFLATE_DEFAULT_LIMIT);
+}
+
+// Decompresses a zlib stream into dst, which holds cap bytes, and returns the
+// number of bytes written.
+Result<uint64, string> zlib_decompress_into(*uint8 src, uint64 len, *uint8 dst, uint64 cap) {
+    string e = _zlib_header(src, len);
+    if (e != null) return Err<uint64, string>(e);
+    uint64 written = 0;
+    uint64 used = 0;
+    e = _inflate(src + 2, len - 2, dst, cap, null, 0, &written, &used);
+    if (e != null) return Err<uint64, string>(e);
+    uint64 end = 2 + used;
+    if (len - end < 4) return Err<uint64, string>("zlib: truncated");
+    if (_zlib_be32(src + end) != adler32(dst, written)) return Err<uint64, string>("zlib: checksum mismatch");
+    return Ok<uint64, string>(written);
+}
