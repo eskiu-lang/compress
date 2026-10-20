@@ -1,0 +1,55 @@
+// CRC-32 and Adler-32 against known values, and the incremental forms
+// against the one-shot ones at every split point of a buffer.
+import <io>;
+import <mem>;
+import <compress/checksum>;
+
+int fails = 0;
+
+void expect(string what, uint32 got, uint32 want) {
+    if (got != want) {
+        printf("FAIL %s: got %08x, want %08x\n", what, got, want);
+        fails++;
+    }
+}
+
+int main() {
+    string s = "123456789";
+    expect("crc32 check", crc32((*uint8)s, 9), (uint32)0xCBF43926);
+    expect("adler32 check", adler32((*uint8)s, 9), (uint32)0x091E01DE);
+    string w = "Wikipedia";
+    expect("adler32 wikipedia", adler32((*uint8)w, 9), (uint32)0x11E60398);
+    expect("crc32 empty", crc32(null, 0), 0);
+    expect("adler32 empty", adler32(null, 0), 1);
+    string fox = "The quick brown fox jumps over the lazy dog";
+    expect("crc32 fox", crc32((*uint8)fox, 43), (uint32)0x414FA339);
+
+    int n = 1000;
+    *uint8 buf = alloc<uint8>(n);
+    defer free((*void)buf);
+    uint32 x = 12345;
+    for (i in 0..n) {
+        x = x * 1103515245 + 12345;
+        buf[i] = (uint8)(x >> 16);
+    }
+    uint32 c = crc32(buf, (uint64)n);
+    uint32 a = adler32(buf, (uint64)n);
+    for (k in 0..n + 1) {
+        uint32 c2 = crc32_update(crc32_update(0, buf, (uint64)k), buf + k, (uint64)(n - k));
+        uint32 a2 = adler32_update(adler32_update(1, buf, (uint64)k), buf + k, (uint64)(n - k));
+        if (c2 != c || a2 != a) {
+            printf("FAIL split at %d\n", k);
+            fails++;
+            break;
+        }
+    }
+    // 1 MB of 0xFF stresses the Adler-32 reduction.
+    int big = 1 << 20;
+    *uint8 ff = alloc<uint8>(big);
+    defer free((*void)ff);
+    memset((*void)ff, 255, (int64)big);
+    expect("adler32 1MB ff", adler32(ff, (uint64)big), (uint32)0x8E88EF11);
+    expect("crc32 1MB ff", crc32(ff, (uint64)big), (uint32)0x956BAC74);
+    if (fails == 0) printf("checksum: ok\n");
+    return fails == 0 ? 0 : 1;
+}

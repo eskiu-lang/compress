@@ -1,0 +1,97 @@
+// checksum.esk: CRC-32 (the gzip and ZIP one) and Adler-32 (the zlib one).
+//
+// Both come in a one-shot form and an incremental one that takes the value
+// returned by the previous call, so data can be checked in pieces:
+//
+//     uint32 c = crc32(data, n);
+//     uint32 d = crc32_update(crc32_update(0, data, 10), data + 10, n - 10);   // c == d
+//
+// The incremental forms start from 0 for CRC-32 and 1 for Adler-32, as zlib's
+// crc32() and adler32() do. CRC-32 reads 8 bytes per step through eight
+// 256-entry tables (slicing-by-8), built on first use.
+
+const uint32 CRC32_INIT = 0;
+const uint32 ADLER32_INIT = 1;
+
+uint32[2048] _crc_tab;
+bool _crc_ready = false;
+
+void _crc_init() {
+    for (n in 0..256) {
+        uint32 c = (uint32)n;
+        for (k in 0..8) {
+            if ((c & 1) != 0) {
+                c = (uint32)0xEDB88320 ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+        }
+        _crc_tab[n] = c;
+    }
+    for (n in 0..256) {
+        uint32 c = _crc_tab[n];
+        for (k in 1..8) {
+            c = _crc_tab[(int)(c & 255)] ^ (c >> 8);
+            _crc_tab[k * 256 + n] = c;
+        }
+    }
+    _crc_ready = true;
+}
+
+// Continues a CRC-32 over n more bytes. crc is 0 for the first piece.
+uint32 crc32_update(uint32 crc, *uint8 p, uint64 n) {
+    if (!_crc_ready) _crc_init();
+    uint32 c = ~crc;
+    uint64 i = 0;
+    while (n - i >= 8) {
+        uint32 a = c ^ ((uint32)p[i] | ((uint32)p[i + 1] << 8) | ((uint32)p[i + 2] << 16) | ((uint32)p[i + 3] << 24));
+        uint32 b = (uint32)p[i + 4] | ((uint32)p[i + 5] << 8) | ((uint32)p[i + 6] << 16) | ((uint32)p[i + 7] << 24);
+        c = _crc_tab[1792 + (int)(a & 255)] ^ _crc_tab[1536 + (int)((a >> 8) & 255)] ^ _crc_tab[1280 + (int)((a >> 16) & 255)] ^ _crc_tab[1024 + (int)(a >> 24)] ^ _crc_tab[768 + (int)(b & 255)] ^ _crc_tab[512 + (int)((b >> 8) & 255)] ^ _crc_tab[256 + (int)((b >> 16) & 255)] ^ _crc_tab[(int)(b >> 24)];
+        i += 8;
+    }
+    while (i < n) {
+        c = _crc_tab[(int)((c ^ (uint32)p[i]) & 255)] ^ (c >> 8);
+        i++;
+    }
+    return ~c;
+}
+
+uint32 crc32(*uint8 p, uint64 n) {
+    return crc32_update(0, p, n);
+}
+
+// Continues an Adler-32 over n more bytes. adler is 1 for the first piece.
+// The sums are reduced every 5552 bytes, the most that cannot overflow 32 bits.
+uint32 adler32_update(uint32 adler, *uint8 p, uint64 n) {
+    uint32 a = adler & 0xFFFF;
+    uint32 b = adler >> 16;
+    uint64 i = 0;
+    while (i < n) {
+        uint64 k = n - i;
+        if (k > 5552) k = 5552;
+        uint64 end = i + k;
+        while (end - i >= 4) {
+            a += (uint32)p[i];
+            b += a;
+            a += (uint32)p[i + 1];
+            b += a;
+            a += (uint32)p[i + 2];
+            b += a;
+            a += (uint32)p[i + 3];
+            b += a;
+            i += 4;
+        }
+        while (i < end) {
+            a += (uint32)p[i];
+            b += a;
+            i++;
+        }
+        a = a % 65521;
+        b = b % 65521;
+    }
+    return (b << 16) | a;
+}
+
+uint32 adler32(*uint8 p, uint64 n) {
+    return adler32_update(1, p, n);
+}
