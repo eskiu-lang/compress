@@ -1,0 +1,141 @@
+// Writes streams and archives made by this package into a directory, for
+// tools/check_with_python.py to read back with Python's zlib, gzip and
+// zipfile. manifest.txt lists each archive entry as
+// "ARCHIVE NAME INPUT LENGTH": its data is the first LENGTH bytes of INPUT,
+// "-" for a directory and "=" for data equal to the entry's name.
+import <io>;
+import <fs>;
+import <mem>;
+import <bytes>;
+import <string>;
+import <compress>;
+
+string dir;
+String manifest;
+uint32 seed = 5;
+
+uint32 rnd() {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >> 17);
+    seed = seed ^ (seed << 5);
+    return seed;
+}
+
+Result<int, string> save(string name, Bytes* b) {
+    let p: String;
+    p.init(128);
+    String_format(&p, "%s/%s", dir, name);
+    int ok = fs_write_all(p.data, b.data, b.len);
+    p.free();
+    if (ok != 1) return Err<int, string>("cannot write a sample");
+    return Ok<int, string>(0);
+}
+
+void note(string archive, string name, string input, int64 len) {
+    String_appendf(&manifest, "%s %s %s %lld\n", archive, name, input, len);
+}
+
+Result<int, string> run() {
+    let text: Bytes;
+    text.init(300000);
+    string words = "the quick brown fox jumps over the lazy dog while the window slides along the stream of literal symbols ";
+    int64 nw = strlen(words);
+    while (text.len < 300000) {
+        int64 at = (int64)(rnd() % (uint32)(nw - 20));
+        text.append_raw((*uint8)words + at, 3 + (int64)(rnd() % 17));
+    }
+    text.len = 300000;
+    save("text.bin", &text)?;
+    let noise: Bytes;
+    noise.init(70000);
+    while (noise.len < 70000) noise.push((uint8)(rnd() >> 3));
+    save("noise.bin", &noise)?;
+
+    let name: String;
+    name.init(64);
+    for (lv in 0..10) {
+        Bytes r = deflate_raw(text.data, (uint64)text.len, lv)?;
+        String_format(&name, "text_%d.deflate", lv);
+        save(name.data, &r)?;
+        r.free();
+        Bytes z = zlib_compress(text.data, (uint64)text.len, lv)?;
+        String_format(&name, "text_%d.zz", lv);
+        save(name.data, &z)?;
+        z.free();
+        Bytes g = gzip_compress(text.data, (uint64)text.len, lv)?;
+        String_format(&name, "text_%d.gz", lv);
+        save(name.data, &g)?;
+        g.free();
+    }
+    Bytes nz = zlib_compress(noise.data, (uint64)noise.len, 9)?;
+    save("noise_9.zz", &nz)?;
+    nz.free();
+    GzipOptions o = GzipOptions{level: 6, name: "text.bin", comment: "made by tools/samples.esk", mtime: 1700000000};
+    Bytes ng = gzip_compress_with(text.data, (uint64)text.len, &o)?;
+    save("named.gz", &ng)?;
+    ng.free();
+
+    for (z64 in 0..2) {
+        string archive = z64 == 0 ? "plain.zip" : "zip64.zip";
+        ZipWriter w = ZipWriter_new();
+        w.zip64 = z64 == 1;
+        w.add_dir("docs")?;
+        note(archive, "docs/", "-", 0);
+        w.add_dir("docs/empty/")?;
+        note(archive, "docs/empty/", "-", 0);
+        for (lv in 0..10) {
+            String_format(&name, "docs/level%d.txt", lv);
+            w.add(name.data, text.data, (uint64)(1000 + lv * 20000), lv)?;
+            note(archive, name.data, "text.bin", (int64)(1000 + lv * 20000));
+        }
+        w.add("noise.bin", noise.data, (uint64)noise.len, 9)?;
+        note(archive, "noise.bin", "noise.bin", noise.len);
+        w.add("empty.txt", null, 0, 6)?;
+        note(archive, "empty.txt", "text.bin", 0);
+        w.add("naïve café.txt", text.data, 777, 6)?;
+        note(archive, "naïve café.txt", "text.bin", 777);
+        Bytes zb = w.finish()?;
+        save(archive, &zb)?;
+        zb.free();
+        w.free();
+    }
+
+    ZipWriter m = ZipWriter_new();
+    for (i in 0..70000) {
+        String_format(&name, "d%02d/f%05d", i / 1000, i);
+        m.add(name.data, (*uint8)name.data, (uint64)name.len, i % 3 == 0 ? 6 : 0)?;
+        if (i % 9999 == 0) note("many.zip", name.data, "=", name.len);
+    }
+    String_format(&name, "%s/many.zip", dir);
+    m.finish_file(name.data)?;
+    m.free();
+
+    name.free();
+    text.free();
+    noise.free();
+    let p: String;
+    p.init(128);
+    String_format(&p, "%s/manifest.txt", dir);
+    if (fs_write_text(p.data, manifest.data) != 0) return Err<int, string>("cannot write the manifest");
+    p.free();
+    return Ok<int, string>(0);
+}
+
+int main(int argc, string* argv) {
+    if (argc != 2) {
+        printf("usage: samples DIR\n");
+        return 2;
+    }
+    dir = argv[1];
+    if (fs_mkdir_p(dir) != 0) {
+        printf("cannot create %s\n", dir);
+        return 1;
+    }
+    manifest.init(4096);
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
