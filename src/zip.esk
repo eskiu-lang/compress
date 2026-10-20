@@ -343,8 +343,13 @@ Result<Bytes, string> ZipReader_read(ZipReader* self, int i) {
     uint64 at = lh + 30 + _zip_u16(self.data + lh + 26) + _zip_u16(self.data + lh + 28);
     if (at > self.len || self.len - at < e.compressed_size) return Err<Bytes, string>("zip: truncated entry");
     *uint8 src = self.data + at;
+    // DEFLATE expands at most about 1032 times, so a stated size larger than
+    // that is not believed for the first allocation; the buffer grows if the
+    // data really is that large.
+    uint64 guess = e.size;
+    if (e.method == ZIP_DEFLATED && guess / 1032 > e.compressed_size) guess = e.compressed_size * 1032 + 1024;
     let out: Bytes;
-    out.init((int64)e.size + 1);
+    out.init((int64)guess + 1);
     if (out.data == null) return Err<Bytes, string>("zip: out of memory");
     if (e.method == ZIP_STORED) {
         if (e.compressed_size != e.size) {
