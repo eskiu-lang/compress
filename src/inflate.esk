@@ -41,8 +41,8 @@ struct _InfHuff {
 
 // The decoder state. dst holds cap bytes of which out are written; with grow
 // set, dst is that Bytes' buffer and is reallocated (up to limit bytes) when
-// full. base is where this stream's output starts: a distance may not reach
-// before it.
+// full; cap is then the smaller of the limit and the allocated size. base is
+// where this stream's output starts: a distance may not reach before it.
 struct _Inflate {
     *uint8 src;
     uint64 len;
@@ -56,6 +56,7 @@ struct _Inflate {
     uint64 base;
     *Bytes grow;
     bool owned;
+    uint64 alloced;
     uint64 limit;
     _InfHuff lit;
     _InfHuff dist;
@@ -117,6 +118,7 @@ string _inf_room(*_Inflate z, uint64 n) {
     if (z.owned && z.dst != null) free((*void)z.dst);
     z.dst = nb;
     z.cap = nc;
+    z.alloced = nc;
     z.owned = true;
     return null;
 }
@@ -345,7 +347,9 @@ string _inflate(*uint8 src, uint64 len, *uint8 dst, uint64 cap, *Bytes grow, uin
         z.dst = grow.data;
         z.out = (uint64)grow.len;
         z.owned = grow.cap > 0;
-        z.cap = z.owned ? (uint64)grow.cap - 1 : z.out;
+        z.alloced = z.owned ? (uint64)grow.cap - 1 : z.out;
+        z.cap = z.alloced;
+        if (z.cap > limit) z.cap = z.out > limit ? z.out : limit;
         z.base = z.out;
         z.limit = limit;
     } else {
@@ -356,7 +360,7 @@ string _inflate(*uint8 src, uint64 len, *uint8 dst, uint64 cap, *Bytes grow, uin
     if (grow != null) {
         if (z.owned) {
             grow.data = z.dst;
-            grow.cap = (int64)z.cap + 1;
+            grow.cap = (int64)z.alloced + 1;
             grow.len = (int64)z.out;
             grow.data[grow.len] = 0;
         }
