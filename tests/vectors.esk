@@ -1,0 +1,155 @@
+// Decodes the reference streams in tests/data (made by Python's zlib and gzip
+// modules, see tools/gen_vectors.py) and compares them with their inputs, in
+// every output form: growing, a buffer of the exact size, one byte too small,
+// and a size limit one byte too low.
+import <io>;
+import <fs>;
+import <mem>;
+import <string>;
+import <list>;
+import <compress>;
+
+int fails = 0;
+
+void fail(string what, string file, string why) {
+    printf("FAIL %s %s: %s\n", what, file, why);
+    fails++;
+}
+
+*uint8 load(string name, *int64 n) {
+    let path: String;
+    path.init(64);
+    String_appendf(&path, "tests/data/%s", name);
+    *uint8 d = fs_read_all(path.data, n);
+    path.free();
+    if (d == null) fail("load", name, "cannot read");
+    return d;
+}
+
+bool same(Bytes* b, *uint8 want, int64 n) {
+    return b.len == n && (n == 0 || memcmp((*void)b.data, (*void)want, n) == 0);
+}
+
+void check(string format, string file, string input) {
+    int64 n = 0;
+    int64 m = 0;
+    *uint8 src = load(file, &n);
+    let bin: String;
+    bin.init(32);
+    String_appendf(&bin, "%s.bin", input);
+    *uint8 want = load(bin.data, &m);
+    bin.free();
+    if (src == null || want == null) return;
+    defer free((*void)src);
+    defer free((*void)want);
+    uint64 len = (uint64)n;
+    Result<Bytes, string> r = Err<Bytes, string>("unknown format");
+    if (strcmp(format, "raw") == 0) r = inflate_raw(src, len);
+    if (strcmp(format, "zlib") == 0) r = zlib_decompress(src, len);
+    if (strcmp(format, "gzip") == 0) r = gzip_decompress(src, len);
+    if (!r.ok) {
+        fail(format, file, r.error);
+        return;
+    }
+    if (!same(&r.value, want, m)) fail(format, file, "wrong output");
+    r.value.free();
+
+    // A limit equal to the size passes; one byte less fails.
+    if (strcmp(format, "raw") == 0) {
+        Result<Bytes, string> a = inflate_raw_limit(src, len, (uint64)m);
+        if (!a.ok || !same(&a.value, want, m)) fail("limit", file, "exact limit failed");
+        if (a.ok) a.value.free();
+        if (m > 0) {
+            Result<Bytes, string> b = inflate_raw_limit(src, len, (uint64)(m - 1));
+            if (b.ok) fail("limit", file, "limit one byte short passed");
+            if (b.ok) b.value.free();
+        }
+    }
+    if (strcmp(format, "gzip") == 0 && m > 0) {
+        Result<Bytes, string> b = gzip_decompress_limit(src, len, (uint64)(m - 1));
+        if (b.ok) fail("limit", file, "gzip limit one byte short passed");
+        if (b.ok) b.value.free();
+    }
+    if (strcmp(format, "zlib") == 0 && m > 0) {
+        Result<Bytes, string> b = zlib_decompress_limit(src, len, (uint64)(m - 1));
+        if (b.ok) fail("limit", file, "zlib limit one byte short passed");
+        if (b.ok) b.value.free();
+    }
+
+    // Fixed buffers: exact size, and one byte short.
+    if (strcmp(format, "raw") == 0 || strcmp(format, "zlib") == 0) {
+        *uint8 dst = alloc<uint8>(m + 1);
+        defer free((*void)dst);
+        Result<uint64, string> x = Err<uint64, string>("");
+        if (strcmp(format, "raw") == 0) {
+            x = inflate_raw_into(src, len, dst, (uint64)m);
+        } else {
+            x = zlib_decompress_into(src, len, dst, (uint64)m);
+        }
+        if (!x.ok) {
+            fail("into", file, x.error);
+        } else if (x.value != (uint64)m || (m > 0 && memcmp((*void)dst, (*void)want, m) != 0)) {
+            fail("into", file, "wrong output");
+        }
+        if (m > 0) {
+            if (strcmp(format, "raw") == 0) {
+                x = inflate_raw_into(src, len, dst, (uint64)(m - 1));
+            } else {
+                x = zlib_decompress_into(src, len, dst, (uint64)(m - 1));
+            }
+            if (x.ok) fail("into", file, "a buffer one byte short passed");
+        }
+    }
+}
+
+void header(string file, string name, string comment, uint32 mtime) {
+    int64 n = 0;
+    *uint8 src = load(file, &n);
+    if (src == null) return;
+    defer free((*void)src);
+    Result<GzipHeader, string> r = gzip_header(src, (uint64)n);
+    if (!r.ok) {
+        fail("header", file, r.error);
+        return;
+    }
+    GzipHeader h = r.value;
+    if (strcmp(h.name.data, name) != 0) fail("header", file, "wrong name");
+    if (strcmp(h.comment.data, comment) != 0) fail("header", file, "wrong comment");
+    if (h.mtime != mtime) fail("header", file, "wrong mtime");
+    h.free();
+}
+
+int main() {
+    let text: String;
+    text.init(4096);
+    if (fs_read_text("tests/data/streams.txt", &text) != 0) {
+        printf("FAIL cannot read tests/data/streams.txt\n");
+        return 1;
+    }
+    let lines: List<String>;
+    List_init<String>(&lines, 64);
+    text.split('\n', &lines);
+    int count = 0;
+    for (i in 0..lines.size) {
+        String* line = &lines.data[i];
+        if (line.len == 0) continue;
+        let parts: List<String>;
+        List_init<String>(&parts, 4);
+        line.split(' ', &parts);
+        if (parts.size == 3) {
+            check(parts.data[0].data, parts.data[1].data, parts.data[2].data);
+            count++;
+        } else {
+            fail("manifest", line.data, "bad line");
+        }
+        String_split_free(&parts);
+    }
+    String_split_free(&lines);
+    text.free();
+    if (count < 40) fail("manifest", "streams.txt", "too few streams");
+    header("fields.gz", "notes.txt", "a comment", 1700000000);
+    header("named.gz", "named.txt", "", 1234567890);
+    header("text.gz", "", "", 0);
+    if (fails == 0) printf("vectors: %d streams ok\n", count);
+    return fails == 0 ? 0 : 1;
+}

@@ -1,0 +1,172 @@
+// Reads the archives in tests/data (made by Python's zipfile and by the zip
+// and ditto commands, see tools/gen_vectors.py): every entry's name, size,
+// CRC-32 and time must match tests/data/zips.txt, and every entry must read.
+// Then extraction: the directory archive is extracted and checked, and the
+// archives with unsafe names are refused without writing anything.
+import <io>;
+import <fs>;
+import <mem>;
+import <string>;
+import <list>;
+import <libc>;
+import <compress>;
+
+int fails = 0;
+
+void fail(string what, string file, string why) {
+    printf("FAIL %s %s: %s\n", what, file, why);
+    fails++;
+}
+
+void open_path(string archive, String* path) {
+    path.clear();
+    String_appendf(path, "tests/data/%s", archive);
+}
+
+// Checks one manifest line: ARCHIVE NAME SIZE CRC MTIME, tab separated.
+void check(List<String>* f) {
+    string archive = f.data[0].data;
+    string name = f.data[1].data;
+    let path: String;
+    path.init(64);
+    defer path.free();
+    open_path(archive, &path);
+    Result<ZipReader, string> r = ZipReader_open(path.data);
+    if (!r.ok) {
+        fail("open", archive, r.error);
+        return;
+    }
+    ZipReader z = r.value;
+    defer z.close();
+    int i = z.find(name);
+    if (i < 0) {
+        fail("find", archive, name);
+        return;
+    }
+    ZipEntry* e = z.entry(i);
+    if (e.size != (uint64)strtoull(f.data[2].data, null, 10)) fail("size", archive, name);
+    if (e.crc != (uint32)strtoull(f.data[3].data, null, 10)) fail("crc", archive, name);
+    if (e.mtime != (int64)strtoll(f.data[4].data, null, 10)) fail("mtime", archive, name);
+    Result<Bytes, string> b = z.read(i);
+    if (!b.ok) {
+        fail("read", archive, b.error);
+        return;
+    }
+    if ((uint64)b.value.len != e.size || crc32(b.value.data, (uint64)b.value.len) != e.crc) fail("read", archive, name);
+    b.value.free();
+}
+
+bool file_is(string path, string want) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) return false;
+    bool ok = n == strlen(want) && memcmp((*void)d, (*void)want, n) == 0;
+    free((*void)d);
+    return ok;
+}
+
+void extract(string tmp) {
+    let dir: String;
+    dir.init(128);
+    defer dir.free();
+    String_appendf(&dir, "%s/out", tmp);
+    Result<ZipReader, string> r = ZipReader_open("tests/data/py_dirs.zip");
+    if (!r.ok) {
+        fail("open", "py_dirs.zip", r.error);
+        return;
+    }
+    ZipReader z = r.value;
+    defer z.close();
+    Result<int, string> x = z.extract_all(dir.data);
+    if (!x.ok || x.value != 6) {
+        fail("extract", "py_dirs.zip", x.ok ? "wrong count" : x.error);
+        return;
+    }
+    let p: String;
+    p.init(128);
+    defer p.free();
+    String_format(&p, "%s/src/main.esk", dir.data);
+    if (!file_is(p.data, "int main() { return 0; }\n")) fail("extract", "py_dirs.zip", "src/main.esk");
+    String_format(&p, "%s/docs/sub", dir.data);
+    if (fs_is_dir(p.data) != 1) fail("extract", "py_dirs.zip", "docs/sub");
+    String_format(&p, "%s/docs/sub/deep.bin", dir.data);
+    FileStat st;
+    if (fs_stat(p.data, &st) != 0 || st.size != 500) fail("extract", "py_dirs.zip", "docs/sub/deep.bin");
+}
+
+void refuse(string tmp, string archive) {
+    let path: String;
+    path.init(64);
+    defer path.free();
+    open_path(archive, &path);
+    Result<ZipReader, string> r = ZipReader_open(path.data);
+    if (!r.ok) {
+        fail("open", archive, r.error);
+        return;
+    }
+    ZipReader z = r.value;
+    defer z.close();
+    let dir: String;
+    dir.init(128);
+    defer dir.free();
+    String_appendf(&dir, "%s/unsafe/inner", tmp);
+    Result<int, string> x = z.extract_all(dir.data);
+    if (x.ok) fail("refuse", archive, "extracted");
+    if (fs_exists(dir.data) == 1) fail("refuse", archive, "created the directory");
+    // Reading the entries is still fine.
+    for (i in 0..z.count()) {
+        Result<Bytes, string> b = z.read(i);
+        if (!b.ok) fail("refuse", archive, b.error);
+        if (b.ok) b.value.free();
+    }
+}
+
+int main() {
+    let text: String;
+    text.init(4096);
+    if (fs_read_text("tests/data/zips.txt", &text) != 0) {
+        printf("FAIL cannot read tests/data/zips.txt\n");
+        return 1;
+    }
+    let lines: List<String>;
+    List_init<String>(&lines, 64);
+    text.split('\n', &lines);
+    int count = 0;
+    for (i in 0..lines.size) {
+        String* line = &lines.data[i];
+        if (line.len == 0) continue;
+        let parts: List<String>;
+        List_init<String>(&parts, 8);
+        line.split('\t', &parts);
+        if (parts.size == 5) {
+            check(&parts);
+            count++;
+        } else {
+            fail("manifest", line.data, "bad line");
+        }
+        String_split_free(&parts);
+    }
+    String_split_free(&lines);
+    text.free();
+    if (count < 30) fail("manifest", "zips.txt", "too few entries");
+
+    if (!zip_name_is_safe("a/b.txt") || !zip_name_is_safe("..a/b..") || !zip_name_is_safe("./x")) fail("names", "safe", "rejected");
+    if (zip_name_is_safe("") || zip_name_is_safe("..") || zip_name_is_safe("a/..") || zip_name_is_safe("\\x") || zip_name_is_safe("c:x")) fail("names", "unsafe", "accepted");
+
+    let tmp: String;
+    tmp.init(128);
+    if (fs_temp_dir("compress_zip", &tmp) != 0) {
+        printf("FAIL cannot make a temp directory\n");
+        return 1;
+    }
+    extract(tmp.data);
+    refuse(tmp.data, "unsafe.zip");
+    refuse(tmp.data, "unsafe_abs.zip");
+    refuse(tmp.data, "unsafe_deep.zip");
+    refuse(tmp.data, "unsafe_back.zip");
+    refuse(tmp.data, "unsafe_drive.zip");
+    fs_remove_all(tmp.data);
+    tmp.free();
+    if (fails == 0) printf("zip_read: %d entries ok\n", count);
+    return fails == 0 ? 0 : 1;
+}
