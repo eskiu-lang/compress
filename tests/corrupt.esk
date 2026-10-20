@@ -1,0 +1,265 @@
+// Hostile input: every truncation of a few streams and archives must be an
+// error, and random byte flips and random garbage must never crash (a flip
+// may still decode, a flip in a gzip time field for one). A hand-built
+// decompression bomb must stop at the size limit, and a ZIP entry whose
+// stated size is wrong must be refused. ITERATIONS is kept small for the
+// test suite; raise it for a longer run under --asan.
+import <io>;
+import <fs>;
+import <mem>;
+import <bytes>;
+import <compress>;
+
+const int ITERATIONS = 300;
+
+int fails = 0;
+uint32 seed = 7;
+
+uint32 rnd() {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >> 17);
+    seed = seed ^ (seed << 5);
+    return seed;
+}
+
+// Decodes buf as the given format. Returns 1 when it decoded, 0 for an error.
+int decode(int format, *uint8 buf, uint64 n) {
+    if (format == 3) {
+        Result<ZipReader, string> r = ZipReader_from(buf, n);
+        if (!r.ok) return 0;
+        ZipReader z = r.value;
+        int ok = 1;
+        for (i in 0..z.count()) {
+            Result<Bytes, string> b = z.read(i);
+            if (b.ok) {
+                b.value.free();
+            } else {
+                ok = 0;
+            }
+        }
+        z.close();
+        return ok;
+    }
+    Result<Bytes, string> r = Err<Bytes, string>("");
+    if (format == 0) r = inflate_raw_limit(buf, n, 1 << 24);
+    if (format == 1) r = zlib_decompress_limit(buf, n, 1 << 24);
+    if (format == 2) r = gzip_decompress_limit(buf, n, 1 << 24);
+    if (!r.ok) return 0;
+    r.value.free();
+    return 1;
+}
+
+void file(string name, int format) {
+    let path: Bytes;
+    path.init(64);
+    path.append_raw((*uint8)"tests/data/", 11);
+    path.append_raw((*uint8)name, strlen(name));
+    path.push(0);
+    int64 n = 0;
+    *uint8 src = fs_read_all(path.cstr(), &n);
+    path.free();
+    if (src == null) {
+        printf("FAIL cannot read %s\n", name);
+        fails++;
+        return;
+    }
+    defer free((*void)src);
+    if (decode(format, src, (uint64)n) != 1) {
+        printf("FAIL %s does not decode\n", name);
+        fails++;
+        return;
+    }
+    // Each prefix goes into a buffer of its own size, so that a read past
+    // the end shows up under --asan.
+    for (k in 0..(int)n) {
+        *uint8 cut = alloc<uint8>((int64)k + 1);
+        memcpy((*void)cut, (*void)src, (int64)k);
+        int ok = decode(format, cut, (uint64)k);
+        free((*void)cut);
+        if (ok != 0) {
+            printf("FAIL %s cut to %d bytes decoded\n", name, k);
+            fails++;
+            return;
+        }
+    }
+    *uint8 buf = alloc<uint8>(n);
+    defer free((*void)buf);
+    for (it in 0..ITERATIONS) {
+        memcpy((*void)buf, (*void)src, n);
+        int flips = 1 + (int)(rnd() % 4);
+        for (f in 0..flips) {
+            // Half the flips go to the last 300 bytes: an archive's directory.
+            uint64 at = (uint64)rnd() % (uint64)n;
+            if (rnd() % 2 == 0 && n > 300) at = (uint64)(n - 300) + (uint64)rnd() % 300;
+            buf[at] = (uint8)((int)buf[at] ^ (1 + (int)(rnd() % 255)));
+        }
+        decode(format, buf, (uint64)n);
+    }
+}
+
+void garbage() {
+    for (it in 0..ITERATIONS) {
+        int n = (int)(rnd() % 2000);
+        *uint8 buf = alloc<uint8>((int64)n + 1);
+        for (i in 0..n) buf[i] = (uint8)rnd();
+        // Valid-looking starts lead the decoders further in.
+        if (n > 2 && it % 3 == 1) {
+            buf[0] = 0x78;
+            buf[1] = 0x9c;
+        }
+        if (n > 10 && it % 3 == 2) {
+            buf[0] = 0x1f;
+            buf[1] = 0x8b;
+            buf[2] = 8;
+            buf[3] = 0;
+        }
+        for (format in 0..4) decode(format, buf, (uint64)n);
+        free((*void)buf);
+    }
+}
+
+// A bit writer for the bomb: bits go out least significant first, Huffman
+// codes most significant first.
+struct Bits {
+    Bytes b;
+    uint32 acc;
+    int count;
+}
+
+void put(Bits* w, int v, int n) {
+    for (i in 0..n) {
+        w.acc = w.acc | ((uint32)((v >> i) & 1) << w.count);
+        w.count++;
+        if (w.count == 8) {
+            w.b.push((uint8)w.acc);
+            w.acc = 0;
+            w.count = 0;
+        }
+    }
+}
+
+void code(Bits* w, int c, int n) {
+    int i = n - 1;
+    while (i >= 0) {
+        put(w, (c >> i) & 1, 1);
+        i--;
+    }
+}
+
+// One dynamic block whose only codes are literal 0, end of block, length 258
+// (a 1-bit code) and distance 1 (a 1-bit code): after one literal every zero
+// bit pair is 258 more bytes, so n zero bytes expand to about 1032 n.
+Bytes bomb(int n) {
+    let w: Bits;
+    w.b.init((int64)n + 64);
+    put(&w, 1, 1);
+    put(&w, 2, 2);
+    put(&w, 29, 5);
+    put(&w, 0, 5);
+    put(&w, 14, 4);
+    // Code length code lengths in the order 16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1:
+    // 18 gets 1 bit, 1 and 2 get 2 bits.
+    int[18] cl = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2};
+    for (i in 0..18) put(&w, cl[i], 3);
+    // Codes: 18 = 0, 1 = 10, 2 = 11. Lengths: literal 0 = 2, 255 zeros,
+    // 256 = 2, 28 zeros, 285 = 1, distance 0 = 1.
+    code(&w, 3, 2);
+    code(&w, 0, 1);
+    put(&w, 127, 7);
+    code(&w, 0, 1);
+    put(&w, 106, 7);
+    code(&w, 3, 2);
+    code(&w, 0, 1);
+    put(&w, 17, 7);
+    code(&w, 2, 2);
+    code(&w, 2, 2);
+    // Literal/length codes: 285 = 0, 0 = 10, 256 = 11. One literal 0.
+    code(&w, 2, 2);
+    for (i in 0..n * 4) put(&w, 0, 2);
+    code(&w, 3, 2);
+    put(&w, 0, 7);
+    return w.b;
+}
+
+void bombs() {
+    Bytes small = bomb(1000);
+    Result<Bytes, string> r = inflate_raw(small.data, (uint64)small.len);
+    if (!r.ok || r.value.len != 1 + 258 * 4000) {
+        printf("FAIL small bomb: %s\n", r.ok ? "wrong size" : r.error);
+        fails++;
+    }
+    if (r.ok) r.value.free();
+    small.free();
+
+    Bytes big = bomb(256 * 1024);
+    r = inflate_raw_limit(big.data, (uint64)big.len, 64 << 20);
+    if (r.ok || strcmp(r.error, "inflate: output exceeds the size limit") != 0) {
+        printf("FAIL bomb: %s\n", r.ok ? "decoded" : r.error);
+        fails++;
+    }
+    if (r.ok) r.value.free();
+    // The same inside a gzip member.
+    let g: Bytes;
+    g.init(big.len + 32);
+    for (i in 0..10) g.push(i == 0 ? 0x1f : (i == 1 ? 0x8b : (i == 2 ? 8 : 0)));
+    g.append(&big);
+    for (i in 0..8) g.push(0);
+    r = gzip_decompress_limit(g.data, (uint64)g.len, 64 << 20);
+    if (r.ok || strcmp(r.error, "inflate: output exceeds the size limit") != 0) {
+        printf("FAIL gzip bomb: %s\n", r.ok ? "decoded" : r.error);
+        fails++;
+    }
+    if (r.ok) r.value.free();
+    g.free();
+    big.free();
+}
+
+// Writes an archive with one deflated entry and changes the size its central
+// directory states.
+void lying_zip(uint64 stated, string want) {
+    let t: Bytes;
+    t.init(5000);
+    for (i in 0..5000) t.push((uint8)(97 + i % 7));
+    ZipWriter w = ZipWriter_new();
+    (void)w.add("a.txt", t.data, (uint64)t.len, 6);
+    Bytes zip = w.finish().value;
+    w.free();
+    t.free();
+    int64 at = 0;
+    while (!(zip.data[at] == 0x50 && zip.data[at + 1] == 0x4b && zip.data[at + 2] == 1 && zip.data[at + 3] == 2)) at++;
+    for (i in 0..4) zip.data[at + 24 + i] = (uint8)(stated >> (8 * i));
+    Result<ZipReader, string> r = ZipReader_from(zip.data, (uint64)zip.len);
+    if (!r.ok) {
+        printf("FAIL lying zip: %s\n", r.error);
+        fails++;
+    } else {
+        ZipReader z = r.value;
+        Result<Bytes, string> b = z.read(0);
+        if (b.ok || strcmp(b.error, want) != 0) {
+            printf("FAIL lying zip %llu: %s\n", stated, b.ok ? "read" : b.error);
+            fails++;
+        }
+        if (b.ok) b.value.free();
+        z.close();
+    }
+    zip.free();
+}
+
+int main() {
+    file("text_l6.deflate", 0);
+    file("binary_huffman.deflate", 0);
+    file("runs_fixed.deflate", 0);
+    file("text_l9.zz", 1);
+    file("fields.gz", 2);
+    file("binary.gz", 2);
+    file("py_deflated.zip", 3);
+    file("py_zip64.zip", 3);
+    file("cli_zip.zip", 3);
+    garbage();
+    bombs();
+    lying_zip(4000, "zip: entry larger than its stated size");
+    lying_zip(6000, "zip: size mismatch");
+    lying_zip(3000000000, "zip: entry exceeds the size limit");
+    if (fails == 0) printf("corrupt: ok\n");
+    return fails == 0 ? 0 : 1;
+}

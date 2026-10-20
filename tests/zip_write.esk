@@ -1,0 +1,153 @@
+// Writes archives with ZipWriter and reads them back with ZipReader: stored,
+// deflated and directory entries, UTF-8 names, forced ZIP64 records and an
+// archive of 70000 entries (which needs ZIP64 for its entry count).
+// tools/check_with_python.py checks that Python's zipfile reads what the
+// writer makes.
+import <io>;
+import <mem>;
+import <bytes>;
+import <string>;
+import <compress>;
+
+int fails = 0;
+
+void fail(string what, string why) {
+    printf("FAIL %s: %s\n", what, why);
+    fails++;
+}
+
+Bytes text(int n) {
+    let b: Bytes;
+    b.init((int64)n + 1);
+    string s = "zip writer test line, with some words repeated, words repeated\n";
+    int64 k = strlen(s);
+    while (b.len < (int64)n) b.push((uint8)s[(int)(b.len % k)]);
+    return b;
+}
+
+Bytes noise(int n) {
+    let b: Bytes;
+    b.init((int64)n + 1);
+    uint32 x = 99;
+    while (b.len < (int64)n) {
+        x = x * 1664525 + 1013904223;
+        b.push((uint8)(x >> 24));
+    }
+    return b;
+}
+
+void expect_entry(ZipReader* z, string name, int method, Bytes* want, bool dir) {
+    int i = z.find(name);
+    if (i < 0) {
+        fail("find", name);
+        return;
+    }
+    ZipEntry* e = z.entry(i);
+    if (e.method != method) fail("method", name);
+    if (e.is_dir != dir) fail("is_dir", name);
+    if (e.mtime != 1700000000) fail("mtime", name);
+    Result<Bytes, string> r = z.read(i);
+    if (!r.ok) {
+        fail(name, r.error);
+        return;
+    }
+    if (want == null) {
+        if (r.value.len != 0) fail("size", name);
+    } else if (r.value.len != want.len || memcmp((*void)r.value.data, (*void)want.data, want.len) != 0) {
+        fail("data", name);
+    }
+    r.value.free();
+}
+
+Result<int, string> basic(bool zip64) {
+    Bytes t = text(50000);
+    defer t.free();
+    Bytes r = noise(4000);
+    defer r.free();
+    let one: Bytes;
+    one.init(4);
+    defer one.free();
+    one.push(33);
+
+    ZipWriter w = ZipWriter_new();
+    defer w.free();
+    w.mtime = 1700000000;
+    w.zip64 = zip64;
+    w.add_dir("docs")?;
+    w.add_dir("docs/sub/")?;
+    w.add("docs/l0.txt", t.data, (uint64)t.len, 0)?;
+    w.add("docs/l1.txt", t.data, (uint64)t.len, 1)?;
+    w.add("docs/sub/l9.txt", t.data, (uint64)t.len, 9)?;
+    w.add("noise.bin", r.data, (uint64)r.len, 6)?;
+    w.add("empty", null, 0, 6)?;
+    w.add("one", one.data, 1, 6)?;
+    w.add("café.txt", t.data, 100, 6)?;
+    Result<int, string> bad = w.add("", t.data, 1, 6);
+    if (bad.ok) fail("writer", "empty name accepted");
+    Bytes zip = w.finish()?;
+    defer zip.free();
+    Result<int, string> late = w.add("late", t.data, 1, 6);
+    if (late.ok) fail("writer", "add after finish accepted");
+
+    ZipReader z = ZipReader_from(zip.data, (uint64)zip.len)?;
+    defer z.close();
+    if (z.count() != 9) fail("count", zip64 ? "zip64" : "basic");
+    expect_entry(&z, "docs/", ZIP_STORED, null, true);
+    expect_entry(&z, "docs/sub/", ZIP_STORED, null, true);
+    expect_entry(&z, "docs/l0.txt", ZIP_STORED, &t, false);
+    expect_entry(&z, "docs/l1.txt", ZIP_DEFLATED, &t, false);
+    expect_entry(&z, "docs/sub/l9.txt", ZIP_DEFLATED, &t, false);
+    expect_entry(&z, "noise.bin", ZIP_STORED, &r, false);
+    expect_entry(&z, "empty", ZIP_STORED, null, false);
+    expect_entry(&z, "one", ZIP_STORED, &one, false);
+    let head: Bytes;
+    head.init(128);
+    defer head.free();
+    head.append_raw(t.data, 100);
+    expect_entry(&z, "café.txt", ZIP_DEFLATED, &head, false);
+    if ((z.entry(z.find("café.txt")).flags & 0x800) == 0) fail("flags", "UTF-8 bit not set");
+    // ZIP64 adds 20 bytes to each local header, 28 to each central one and
+    // 76 for the end records.
+    return Ok<int, string>((int)zip.len);
+}
+
+Result<int, string> many() {
+    ZipWriter w = ZipWriter_new();
+    defer w.free();
+    w.mtime = 1700000000;
+    let name: String;
+    name.init(32);
+    defer name.free();
+    for (i in 0..70000) {
+        String_format(&name, "f%05d", i);
+        w.add(name.data, (*uint8)name.data, (uint64)name.len, 0)?;
+    }
+    Bytes zip = w.finish()?;
+    defer zip.free();
+    ZipReader z = ZipReader_from(zip.data, (uint64)zip.len)?;
+    defer z.close();
+    if (z.count() != 70000) fail("many", "wrong count");
+    for (k in 0..7) {
+        int i = k * 9999;
+        String_format(&name, "f%05d", i);
+        Bytes b = z.read_name(name.data)?;
+        if (b.len != name.len || memcmp((*void)b.data, (*void)name.data, b.len) != 0) fail("many", name.data);
+        b.free();
+    }
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> a = basic(false);
+    if (!a.ok) fail("basic", a.error);
+    Result<int, string> b = basic(true);
+    if (!b.ok) fail("zip64", b.error);
+    if (a.ok && b.ok && b.value - a.value != 9 * 48 + 76) {
+        printf("FAIL zip64: %d bytes, plain %d\n", b.value, a.value);
+        fails++;
+    }
+    Result<int, string> m = many();
+    if (!m.ok) fail("many", m.error);
+    if (fails == 0) printf("zip_write: ok\n");
+    return fails == 0 ? 0 : 1;
+}

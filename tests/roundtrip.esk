@@ -1,0 +1,200 @@
+// Compresses and decompresses text, binary records, random bytes, empty and
+// 1-byte inputs, highly repetitive data and a 5 MB mix at every level, in raw
+// DEFLATE, zlib and gzip form, and checks that the data comes back and the
+// sizes make sense.
+import <io>;
+import <mem>;
+import <bytes>;
+import <compress>;
+
+int fails = 0;
+uint32 seed = 1;
+
+uint32 rnd() {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >> 17);
+    seed = seed ^ (seed << 5);
+    return seed;
+}
+
+const string[24] WORDS = {"the", "of", "and", "to", "in", "is", "that", "for", "window", "block", "length", "distance", "literal", "symbol", "stream", "header", "archive", "entry", "table", "huffman", "match", "chain", "checksum", "compress"};
+
+void fill_text(Bytes* b, int64 n) {
+    while (b.len < n) {
+        string w = WORDS[(int)(rnd() % 24)];
+        b.append_raw((*uint8)w, strlen(w));
+        uint32 x = rnd() % 100;
+        b.push(x < 5 ? 10 : 32);
+    }
+    b.len = n;
+}
+
+void fill_binary(Bytes* b, int64 n) {
+    int v = 1000;
+    uint32 i = 0;
+    while (b.len < n) {
+        v += (int)(rnd() % 7) - 3;
+        b.push((uint8)i);
+        b.push((uint8)(i >> 8));
+        b.push((uint8)(i >> 16));
+        b.push((uint8)(i >> 24));
+        b.push((uint8)v);
+        b.push((uint8)(v >> 8));
+        b.push((uint8)rnd());
+        i++;
+    }
+    b.len = n;
+}
+
+void fill_random(Bytes* b, int64 n) {
+    while (b.len < n) b.push((uint8)(rnd() >> 7));
+}
+
+void fill_byte(Bytes* b, int64 n, uint8 c) {
+    while (b.len < n) b.push(c);
+}
+
+void fill_pattern(Bytes* b, int64 n) {
+    string p = "abcdefghij0123456789";
+    while (b.len < n) b.push((uint8)p[(int)(b.len % 20)]);
+}
+
+bool same(Bytes* a, Bytes* b) {
+    return a.len == b.len && (a.len == 0 || memcmp((*void)a.data, (*void)b.data, a.len) == 0);
+}
+
+// Raw DEFLATE at a level, then zlib and gzip when framed is set. Returns the
+// raw compressed size.
+int64 trip(string name, Bytes* src, int level, bool framed) {
+    uint64 n = (uint64)src.len;
+    Result<Bytes, string> c = deflate_raw(src.data, n, level);
+    if (!c.ok) {
+        printf("FAIL %s level %d: %s\n", name, level, c.error);
+        fails++;
+        return 0;
+    }
+    int64 size = c.value.len;
+    if ((uint64)size > deflate_bound(n)) {
+        printf("FAIL %s level %d: %lld bytes is over the bound\n", name, level, size);
+        fails++;
+    }
+    Result<Bytes, string> d = inflate_raw(c.value.data, (uint64)size);
+    if (!d.ok || !same(&d.value, src)) {
+        printf("FAIL %s level %d: raw round trip (%s)\n", name, level, d.ok ? "different data" : d.error);
+        fails++;
+    }
+    if (d.ok) d.value.free();
+    c.value.free();
+    if (!framed) return size;
+
+    Result<Bytes, string> z = zlib_compress(src.data, n, level);
+    Result<Bytes, string> zd = zlib_decompress(z.value.data, (uint64)z.value.len);
+    if (!z.ok || !zd.ok || !same(&zd.value, src) || z.value.len != size + 6) {
+        printf("FAIL %s level %d: zlib round trip\n", name, level);
+        fails++;
+    }
+    if (zd.ok) zd.value.free();
+    z.value.free();
+
+    Result<Bytes, string> g = gzip_compress(src.data, n, level);
+    Result<Bytes, string> gd = gzip_decompress(g.value.data, (uint64)g.value.len);
+    if (!g.ok || !gd.ok || !same(&gd.value, src) || g.value.len != size + 18) {
+        printf("FAIL %s level %d: gzip round trip\n", name, level);
+        fails++;
+    }
+    if (gd.ok) gd.value.free();
+    g.value.free();
+    return size;
+}
+
+void all_levels(string name, Bytes* src, bool framed) {
+    int64[10] sizes;
+    for (lv in 0..10) sizes[lv] = trip(name, src, lv, framed);
+    int64 n = src.len;
+    // Level 0 is stored blocks: 5 bytes per 65535 bytes, one empty block for no data.
+    int64 stored = n + 5 * (n == 0 ? 1 : (n + 65534) / 65535);
+    if (sizes[0] != stored) {
+        printf("FAIL %s: level 0 gave %lld bytes, want %lld\n", name, sizes[0], stored);
+        fails++;
+    }
+    // Compressing never costs more than storing, though the other levels
+    // store in blocks of 16384 symbols, 5 bytes each.
+    int64 worst = n + 5 * (n / 16384 + 1) + 2;
+    for (lv in 1..10) {
+        if (sizes[lv] > worst) {
+            printf("FAIL %s level %d: %lld bytes, more than stored %lld\n", name, lv, sizes[lv], stored);
+            fails++;
+        }
+    }
+    printf("%-10s %8lld:", name, n);
+    for (lv in 0..10) printf(" %lld", sizes[lv]);
+    printf("\n");
+}
+
+int main() {
+    let b: Bytes;
+    b.init(16);
+
+    all_levels("empty", &b, true);
+    b.push(65);
+    all_levels("one", &b, true);
+    b.len = 0;
+    fill_text(&b, 200000);
+    all_levels("text", &b, true);
+    b.len = 0;
+    fill_binary(&b, 150000);
+    all_levels("binary", &b, true);
+    b.len = 0;
+    fill_random(&b, 100000);
+    all_levels("random", &b, true);
+    b.len = 0;
+    fill_byte(&b, 1000000, 97);
+    all_levels("zeros", &b, true);
+    b.len = 0;
+    fill_pattern(&b, 300000);
+    all_levels("pattern", &b, true);
+    // Short inputs around the match and block thresholds.
+    for (n in 2..12) {
+        b.len = 0;
+        fill_text(&b, (int64)n);
+        for (lv in 0..10) trip("short", &b, lv, true);
+    }
+    b.len = 0;
+    fill_byte(&b, 65535, 0);
+    trip("stored65535", &b, 0, true);
+    b.push(1);
+    trip("stored65536", &b, 0, true);
+
+    // 5 MB: text, binary, random and runs in 64 KB pieces.
+    b.len = 0;
+    let piece: Bytes;
+    piece.init(65536);
+    int k = 0;
+    while (b.len < 5000000) {
+        piece.len = 0;
+        int kind = k % 4;
+        if (kind == 0) fill_text(&piece, 65536);
+        if (kind == 1) fill_binary(&piece, 65536);
+        if (kind == 2) fill_random(&piece, 16384);
+        if (kind == 3) fill_byte(&piece, 30000, (uint8)k);
+        b.append(&piece);
+        k++;
+    }
+    piece.free();
+    all_levels("5MB", &b, false);
+    trip("5MB", &b, 1, true);
+    trip("5MB", &b, 9, true);
+
+    // Random data does not shrink, text does.
+    b.len = 0;
+    fill_text(&b, 100000);
+    int64 t1 = trip("text", &b, 1, false);
+    int64 t9 = trip("text", &b, 9, false);
+    if (t9 > t1 || t9 > 40000) {
+        printf("FAIL text sizes %lld at level 1, %lld at level 9\n", t1, t9);
+        fails++;
+    }
+    b.free();
+    if (fails == 0) printf("roundtrip: ok\n");
+    return fails == 0 ? 0 : 1;
+}

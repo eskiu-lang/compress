@@ -1,0 +1,156 @@
+// zlib and gzip framing: header fields, multi-member files, trailing data,
+// and the errors for bad headers, checksums and sizes.
+import <io>;
+import <mem>;
+import <bytes>;
+import <compress/zlib>;
+import <compress/gzip>;
+
+int fails = 0;
+string data = "It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness.";
+
+void expect_ok(string what, Result<Bytes, string> r, *uint8 want, int64 n) {
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", what, r.error);
+        fails++;
+        return;
+    }
+    if (r.value.len != n || (n > 0 && memcmp((*void)r.value.data, (*void)want, n) != 0)) {
+        printf("FAIL %s: wrong output\n", what);
+        fails++;
+    }
+    r.value.free();
+}
+
+void expect_err(string what, Result<Bytes, string> r, string msg) {
+    if (r.ok) {
+        printf("FAIL %s: accepted\n", what);
+        fails++;
+        r.value.free();
+        return;
+    }
+    if (msg != null && strcmp(r.error, msg) != 0) {
+        printf("FAIL %s: got \"%s\", want \"%s\"\n", what, r.error, msg);
+        fails++;
+    }
+}
+
+Bytes copy(Bytes* b) {
+    let c: Bytes;
+    c.init(b.len + 1);
+    c.append_raw(b.data, b.len);
+    return c;
+}
+
+int main() {
+    *uint8 d = (*uint8)data;
+    uint64 n = (uint64)strlen(data);
+
+    // zlib
+    Bytes z = zlib_compress(d, n, 6).value;
+    expect_ok("zlib", zlib_decompress(z.data, (uint64)z.len), d, (int64)n);
+    if (z.data[0] != 0x78 || z.data[1] != 0x9c) {
+        printf("FAIL zlib header %02x %02x\n", z.data[0], z.data[1]);
+        fails++;
+    }
+    Bytes t = copy(&z);
+    t.append_raw((*uint8)"junk", 4);
+    expect_ok("zlib trailing data", zlib_decompress(t.data, (uint64)t.len), d, (int64)n);
+    t.free();
+    t = copy(&z);
+    t.data[t.len - 1] ^= 1;
+    expect_err("zlib adler", zlib_decompress(t.data, (uint64)t.len), "zlib: checksum mismatch");
+    t.free();
+    t = copy(&z);
+    int fd = 0x20 + (31 - (0x78 * 256 + 0x20) % 31) % 31;
+    t.data[1] = (uint8)fd;
+    expect_err("zlib dictionary", zlib_decompress(t.data, (uint64)t.len), "zlib: preset dictionary not supported");
+    t.free();
+    t = copy(&z);
+    t.data[0] = 0x79;
+    expect_err("zlib method", zlib_decompress(t.data, (uint64)t.len), "zlib: bad header");
+    t.free();
+    expect_err("zlib empty", zlib_decompress(null, 0), "zlib: truncated");
+    expect_err("zlib no checksum", zlib_decompress(z.data, (uint64)z.len - 4), "zlib: truncated");
+    for (lv in 0..10) {
+        Bytes h = zlib_compress(d, n, lv).value;
+        if ((((int)h.data[0] * 256 + (int)h.data[1]) % 31) != 0) {
+            printf("FAIL zlib header check at level %d\n", lv);
+            fails++;
+        }
+        h.free();
+    }
+    z.free();
+
+    // gzip header fields
+    GzipOptions o = GzipOptions{level: 9, name: "best.txt", comment: "two cities", mtime: 1700000123};
+    Bytes g = gzip_compress_with(d, n, &o).value;
+    expect_ok("gzip named", gzip_decompress(g.data, (uint64)g.len), d, (int64)n);
+    Result<GzipHeader, string> h = gzip_header(g.data, (uint64)g.len);
+    if (!h.ok || strcmp(h.value.name.data, "best.txt") != 0 || strcmp(h.value.comment.data, "two cities") != 0 || h.value.mtime != 1700000123 || h.value.xfl != 2) {
+        printf("FAIL gzip header fields\n");
+        fails++;
+    }
+    if (h.ok) h.value.free();
+    Bytes plain = gzip_compress(d, n, 1).value;
+    h = gzip_header(plain.data, (uint64)plain.len);
+    if (!h.ok || h.value.name.len != 0 || h.value.mtime != 0 || h.value.size != 10 || h.value.xfl != 4) {
+        printf("FAIL gzip plain header\n");
+        fails++;
+    }
+    if (h.ok) h.value.free();
+
+    // Multi-member, padding, garbage
+    Bytes both = copy(&g);
+    both.append(&plain);
+    let twice: Bytes;
+    twice.init(256);
+    twice.append_raw(d, (int64)n);
+    twice.append_raw(d, (int64)n);
+    expect_ok("gzip two members", gzip_decompress(both.data, (uint64)both.len), twice.data, twice.len);
+    both.push(0);
+    both.push(0);
+    expect_ok("gzip zero padding", gzip_decompress(both.data, (uint64)both.len), twice.data, twice.len);
+    both.push(7);
+    expect_err("gzip garbage", gzip_decompress(both.data, (uint64)both.len), "gzip: trailing garbage");
+    both.free();
+    both = copy(&g);
+    both.push(0x1f);
+    both.push(0x8b);
+    expect_err("gzip partial member", gzip_decompress(both.data, (uint64)both.len), "gzip: truncated");
+    both.free();
+    twice.free();
+
+    // Corrupt trailers and headers
+    t = copy(&plain);
+    t.data[t.len - 8] ^= 1;
+    expect_err("gzip crc", gzip_decompress(t.data, (uint64)t.len), "gzip: checksum mismatch");
+    t.free();
+    t = copy(&plain);
+    t.data[t.len - 1] ^= 1;
+    expect_err("gzip size", gzip_decompress(t.data, (uint64)t.len), "gzip: size mismatch");
+    t.free();
+    t = copy(&plain);
+    t.data[1] = 0x8c;
+    expect_err("gzip magic", gzip_decompress(t.data, (uint64)t.len), "gzip: not a gzip file");
+    t.free();
+    t = copy(&plain);
+    t.data[3] = 0x20;
+    expect_err("gzip reserved flag", gzip_decompress(t.data, (uint64)t.len), "gzip: reserved flags set");
+    t.free();
+    t = copy(&plain);
+    t.data[3] = 4;
+    expect_err("gzip extra past the end", gzip_decompress(t.data, 12), "gzip: truncated");
+    t.free();
+    t = copy(&g);
+    t.data[3] = (uint8)((int)t.data[3] | 2);
+    expect_err("gzip header crc", gzip_decompress(t.data, (uint64)t.len), null);
+    t.free();
+    expect_err("gzip empty", gzip_decompress(null, 0), "gzip: truncated");
+    expect_err("gzip limit", gzip_decompress_limit(g.data, (uint64)g.len, n - 1), "inflate: output exceeds the size limit");
+    g.free();
+    plain.free();
+
+    if (fails == 0) printf("framing: ok\n");
+    return fails == 0 ? 0 : 1;
+}
