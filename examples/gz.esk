@@ -1,0 +1,65 @@
+// gz: compresses a file to FILE.gz, or with -d decompresses FILE.gz to FILE.
+//
+//     eskiuc build && build/compress notes.txt          # notes.txt.gz
+//     build/compress -9 notes.txt                       # best compression
+//     build/compress -d notes.txt.gz                    # notes.txt
+import <io>;
+import <fs>;
+import <mem>;
+import <string>;
+import <compress>;
+
+Result<int, string> run(string path, int level, bool decompress) {
+    int64 n = 0;
+    *uint8 data = fs_read_all(path, &n);
+    if (data == null) return Err<int, string>("cannot read the file");
+    defer free((*void)data);
+    let out: String;
+    out.from(path);
+    defer out.free();
+    Bytes b;
+    if (decompress) {
+        if (out.len < 4 || strcmp(out.data + out.len - 3, ".gz") != 0) return Err<int, string>("the name does not end in .gz");
+        out.data[out.len - 3] = 0;
+        out.len -= 3;
+        b = gzip_decompress(data, (uint64)n)?;
+    } else {
+        out.append(".gz");
+        string base = path;
+        for (i in 0..(int)strlen(path)) {
+            if (path[i] == '/') base = path + i + 1;
+        }
+        GzipOptions o = GzipOptions{level: level, name: base};
+        b = gzip_compress_with(data, (uint64)n, &o)?;
+    }
+    defer b.free();
+    if (fs_write_all(out.data, b.data, b.len) != 1) return Err<int, string>("cannot write the output");
+    printf("%s: %lld -> %lld bytes\n", out.data, n, b.len);
+    return Ok<int, string>(0);
+}
+
+int main(int argc, string* argv) {
+    int level = 6;
+    bool decompress = false;
+    string path = null;
+    for (i in 1..argc) {
+        string a = argv[i];
+        if (strcmp(a, "-d") == 0) {
+            decompress = true;
+        } else if (a[0] == '-' && a[1] >= '0' && a[1] <= '9' && a[2] == 0) {
+            level = (int)a[1] - 48;
+        } else {
+            path = a;
+        }
+    }
+    if (path == null) {
+        printf("usage: gz [-d] [-0..-9] FILE\n");
+        return 2;
+    }
+    Result<int, string> r = run(path, level, decompress);
+    if (!r.ok) {
+        printf("gz: %s: %s\n", path, r.error);
+        return 1;
+    }
+    return 0;
+}

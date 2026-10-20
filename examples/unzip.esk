@@ -1,0 +1,37 @@
+// unzip: lists a ZIP archive, or with -x DIR extracts it into DIR.
+//
+//     eskiuc -O2 examples/unzip.esk -o build/unzip
+//     build/unzip pack.zip
+//     build/unzip pack.zip -x out
+import <io>;
+import <compress/zip>;
+
+Result<int, string> run(string path, string dir) {
+    ZipReader z = ZipReader_open(path)?;
+    defer z.close();
+    if (dir != null) {
+        int n = z.extract_all(dir)?;
+        printf("%d entries written to %s\n", n, dir);
+        return Ok<int, string>(0);
+    }
+    printf("%12s %12s  %-8s %s\n", "size", "packed", "method", "name");
+    for (i in 0..z.count()) {
+        ZipEntry* e = z.entry(i);
+        string method = e.method == ZIP_DEFLATED ? "deflate" : (e.method == ZIP_STORED ? "stored" : "other");
+        printf("%12llu %12llu  %-8s %s\n", e.size, e.compressed_size, method, e.name.data);
+    }
+    return Ok<int, string>(0);
+}
+
+int main(int argc, string* argv) {
+    if (argc != 2 && !(argc == 4 && strcmp(argv[2], "-x") == 0)) {
+        printf("usage: unzip FILE.zip [-x DIR]\n");
+        return 2;
+    }
+    Result<int, string> r = run(argv[1], argc == 4 ? argv[3] : null);
+    if (!r.ok) {
+        printf("unzip: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
