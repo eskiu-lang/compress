@@ -146,6 +146,13 @@ sources; the binary corpus is the first 8 MB of a Mach-O executable.
 
 `tools/bench.esk` and `tools/bench.py` make these measurements for any file.
 
+## Platforms
+
+The package is plain Eskiu with no native library, so it builds for every target Eskiu has:
+macOS, Linux and Windows, iOS and Android, WebAssembly, and freestanding builds. Its tests
+pass on macOS, Linux and Windows in CI, under node as WebAssembly (emscripten) and on an
+Android arm64 emulator.
+
 ## Install
 
 In an Eskiu package (Eskiu 0.12 or newer):
