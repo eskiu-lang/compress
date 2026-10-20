@@ -1,0 +1,13 @@
+// compress.esk: zlib, gzip and raw DEFLATE compression and decompression,
+// ZIP archives, and the CRC-32 and Adler-32 checksums.
+//
+// Each part is also a module of its own: <compress/checksum>,
+// <compress/inflate>, <compress/deflate>, <compress/zlib>, <compress/gzip> and
+// <compress/zip>.
+
+import <compress/checksum>;
+import <compress/inflate>;
+import <compress/deflate>;
+import <compress/zlib>;
+import <compress/gzip>;
+import <compress/zip>;

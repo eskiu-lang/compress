@@ -62,6 +62,30 @@ struct ZipReader {
     List<ZipEntry> entries;
 }
 
+struct _ZipCentral {
+    String name;
+    int method;
+    int flags;
+    uint32 crc;
+    uint64 csize;
+    uint64 usize;
+    uint64 offset;
+    int dtime;
+    int ddate;
+    uint32 attrs;
+}
+
+// A writer collects the archive in memory. mtime (Unix seconds, the time of
+// ZipWriter_new by default) is stamped on the entries added after it is set;
+// zip64 set to true writes ZIP64 records even when nothing needs them.
+struct ZipWriter {
+    Bytes out;
+    List<_ZipCentral> entries;
+    int64 mtime;
+    bool zip64;
+    bool finished;
+}
+
 // ---- little-endian fields ----
 
 uint64 _zip_u16(*uint8 p) {
@@ -409,4 +433,192 @@ Result<int, string> ZipReader_extract_all(ZipReader* self, string dir) {
         if (ok != 1) return Err<int, string>("zip: cannot write a file");
     }
     return Ok<int, string>(self.entries.size);
+}
+
+// ---- writer ----
+
+ZipWriter ZipWriter_new() {
+    let w: ZipWriter;
+    w.out.init(1024);
+    List_init<_ZipCentral>(&w.entries, 16);
+    w.mtime = time_now_s();
+    return w;
+}
+
+void ZipWriter_free(ZipWriter* self) {
+    for (i in 0..self.entries.size) String_free(&self.entries.data[i].name);
+    if (self.entries.data != null) List_free<_ZipCentral>(&self.entries);
+    self.out.free();
+}
+
+bool _zip_utf8(string s) {
+    int64 n = strlen(s);
+    for (int64 i = 0; i < n; i++) {
+        if ((int)(uint8)s[i] >= 128) return true;
+    }
+    return false;
+}
+
+// Appends a local header and the data, and records the entry.
+Result<int, string> _zip_put(ZipWriter* self, string name, int method, uint32 crc, *uint8 data, uint64 csize, uint64 usize, uint32 attrs) {
+    if (self.finished) return Err<int, string>("zip: the writer is finished");
+    int64 nlen = strlen(name);
+    if (nlen == 0 || nlen > 65535) return Err<int, string>("zip: bad entry name");
+    Bytes* o = &self.out;
+    let c: _ZipCentral;
+    c.method = method;
+    c.flags = _zip_utf8(name) ? 0x800 : 0;
+    c.crc = crc;
+    c.csize = csize;
+    c.usize = usize;
+    c.offset = (uint64)o.len;
+    c.attrs = attrs;
+    _zip_unix_to_dos(self.mtime, &c.dtime, &c.ddate);
+    bool big = self.zip64 || usize >= 0xFFFFFFFF || csize >= 0xFFFFFFFF;
+    o.reserve((int64)csize + nlen + 64);
+    _zip_put32(o, 0x04034b50);
+    _zip_put16(o, big ? 45 : (method == ZIP_DEFLATED ? 20 : 10));
+    _zip_put16(o, (uint64)c.flags);
+    _zip_put16(o, (uint64)method);
+    _zip_put16(o, (uint64)c.dtime);
+    _zip_put16(o, (uint64)c.ddate);
+    _zip_put32(o, (uint64)crc);
+    _zip_put32(o, big ? 0xFFFFFFFF : csize);
+    _zip_put32(o, big ? 0xFFFFFFFF : usize);
+    _zip_put16(o, (uint64)nlen);
+    _zip_put16(o, big ? 20 : 0);
+    o.append_raw((*uint8)name, nlen);
+    if (big) {
+        _zip_put16(o, 1);
+        _zip_put16(o, 16);
+        _zip_put64(o, usize);
+        _zip_put64(o, csize);
+    }
+    if (csize > 0) o.append_raw(data, (int64)csize);
+    c.name.from(name);
+    List_push<_ZipCentral>(&self.entries, c);
+    return Ok<int, string>(0);
+}
+
+// Adds a file entry holding data[0..len), deflated at level (1 to 9) or stored
+// (level 0, or when deflating does not make it smaller).
+Result<int, string> ZipWriter_add(ZipWriter* self, string name, *uint8 data, uint64 len, int level) {
+    uint32 crc = crc32(data, len);
+    uint32 attrs = (uint32)0x81A40000;
+    if (level > 0 && len > 0) {
+        Result<Bytes, string> r = deflate_raw(data, len, level);
+        if (!r.ok) return Err<int, string>(r.error);
+        Bytes c = r.value;
+        defer c.free();
+        if ((uint64)c.len < len) return _zip_put(self, name, ZIP_DEFLATED, crc, c.data, (uint64)c.len, len, attrs);
+    }
+    return _zip_put(self, name, ZIP_STORED, crc, data, len, len, attrs);
+}
+
+// Adds a directory entry; a missing trailing slash is added.
+Result<int, string> ZipWriter_add_dir(ZipWriter* self, string name) {
+    let n: String;
+    n.from(name);
+    defer n.free();
+    if (n.len == 0 || n.data[n.len - 1] != '/') n.push('/');
+    return _zip_put(self, n.data, ZIP_STORED, 0, null, 0, 0, (uint32)0x41ED0010);
+}
+
+// Adds the file at path under the entry name.
+Result<int, string> ZipWriter_add_file(ZipWriter* self, string name, string path, int level) {
+    int64 n = 0;
+    *uint8 data = fs_read_all(path, &n);
+    if (data == null) return Err<int, string>("zip: cannot read the file");
+    defer free((*void)data);
+    return self.add(name, data, (uint64)n, level);
+}
+
+// Writes the central directory and returns the archive. The writer keeps no
+// buffer afterwards; it still has to be freed.
+Result<Bytes, string> ZipWriter_finish(ZipWriter* self) {
+    if (self.finished) return Err<Bytes, string>("zip: the writer is finished");
+    Bytes* o = &self.out;
+    uint64 cd_start = (uint64)o.len;
+    uint64 count = (uint64)self.entries.size;
+    for (i in 0..self.entries.size) {
+        _ZipCentral* c = &self.entries.data[i];
+        bool u64 = self.zip64 || c.usize >= 0xFFFFFFFF;
+        bool c64 = self.zip64 || c.csize >= 0xFFFFFFFF;
+        bool o64 = self.zip64 || c.offset >= 0xFFFFFFFF;
+        uint64 xlen = 0;
+        if (u64) xlen += 8;
+        if (c64) xlen += 8;
+        if (o64) xlen += 8;
+        if (xlen > 0) xlen += 4;
+        bool any64 = xlen > 0 || c.usize >= 0xFFFFFFFF || c.csize >= 0xFFFFFFFF;
+        _zip_put32(o, 0x02014b50);
+        _zip_put16(o, (3 << 8) | 45);
+        _zip_put16(o, any64 ? 45 : (c.method == ZIP_DEFLATED ? 20 : 10));
+        _zip_put16(o, (uint64)c.flags);
+        _zip_put16(o, (uint64)c.method);
+        _zip_put16(o, (uint64)c.dtime);
+        _zip_put16(o, (uint64)c.ddate);
+        _zip_put32(o, (uint64)c.crc);
+        _zip_put32(o, c64 ? 0xFFFFFFFF : c.csize);
+        _zip_put32(o, u64 ? 0xFFFFFFFF : c.usize);
+        _zip_put16(o, (uint64)c.name.len);
+        _zip_put16(o, xlen);
+        _zip_put16(o, 0);
+        _zip_put16(o, 0);
+        _zip_put16(o, 0);
+        _zip_put32(o, (uint64)c.attrs);
+        _zip_put32(o, o64 ? 0xFFFFFFFF : c.offset);
+        o.append_raw((*uint8)c.name.data, c.name.len);
+        if (xlen > 0) {
+            _zip_put16(o, 1);
+            _zip_put16(o, xlen - 4);
+            if (u64) _zip_put64(o, c.usize);
+            if (c64) _zip_put64(o, c.csize);
+            if (o64) _zip_put64(o, c.offset);
+        }
+    }
+    uint64 cd_size = (uint64)o.len - cd_start;
+    bool z64 = self.zip64 || count >= 0xFFFF || cd_start >= 0xFFFFFFFF || cd_size >= 0xFFFFFFFF;
+    if (z64) {
+        uint64 rec = (uint64)o.len;
+        _zip_put32(o, 0x06064b50);
+        _zip_put64(o, 44);
+        _zip_put16(o, (3 << 8) | 45);
+        _zip_put16(o, 45);
+        _zip_put32(o, 0);
+        _zip_put32(o, 0);
+        _zip_put64(o, count);
+        _zip_put64(o, count);
+        _zip_put64(o, cd_size);
+        _zip_put64(o, cd_start);
+        _zip_put32(o, 0x07064b50);
+        _zip_put32(o, 0);
+        _zip_put64(o, rec);
+        _zip_put32(o, 1);
+    }
+    _zip_put32(o, 0x06054b50);
+    _zip_put16(o, 0);
+    _zip_put16(o, 0);
+    _zip_put16(o, z64 ? 0xFFFF : count);
+    _zip_put16(o, z64 ? 0xFFFF : count);
+    _zip_put32(o, z64 ? 0xFFFFFFFF : cd_size);
+    _zip_put32(o, z64 ? 0xFFFFFFFF : cd_start);
+    _zip_put16(o, 0);
+    self.finished = true;
+    Bytes b = self.out;
+    self.out.data = null;
+    self.out.len = 0;
+    self.out.cap = 0;
+    return Ok<Bytes, string>(b);
+}
+
+// Finishes the archive and writes it to path.
+Result<int, string> ZipWriter_finish_file(ZipWriter* self, string path) {
+    Result<Bytes, string> r = self.finish();
+    if (!r.ok) return Err<int, string>(r.error);
+    Bytes b = r.value;
+    int ok = fs_write_all(path, b.data, b.len);
+    b.free();
+    if (ok != 1) return Err<int, string>("zip: cannot write the file");
+    return Ok<int, string>(0);
 }
