@@ -60,8 +60,8 @@ struct _Deflate {
     int lazy;
     int nice;
     int chain;
-    *int64 head;
-    *int64 prev;
+    *uint32 head;
+    *uint32 prev;
     *uint16 slit;
     *uint16 sdist;
     int nsym;
@@ -492,14 +492,30 @@ int _def_hash(*uint8 p) {
     return (int)((v * (uint32)2654435761) >> (32 - _DEF_HBITS));
 }
 
+// The chains hold positions plus one in 32 bits (0 is an empty slot), so a
+// position is recovered from a later one by the difference, modulo 2^32. A
+// stale slot can only give a wrong candidate, and every candidate is checked
+// byte by byte.
+int64 _def_back(int64 from, uint32 v) {
+    uint32 delta = (uint32)(from + 1) - v;
+    if (v == 0 || delta == 0) return -1;
+    return from - (int64)delta;
+}
+
 // Hashes the 3 bytes at pos into the chains; returns the previous position
 // with the same hash, or -1.
 int64 _def_insert(*_Deflate z, uint64 pos) {
     int h = _def_hash(z.src + pos);
-    int64 old = z.head[h];
+    uint32 old = z.head[h];
     z.prev[(int)(pos & (uint64)_DEF_WMASK)] = old;
-    z.head[h] = (int64)pos + 1;
-    return old - 1;
+    z.head[h] = (uint32)(pos + 1);
+    return _def_back((int64)pos, old);
+}
+
+uint64 _def_load64(*uint8 p) {
+    uint64 v = 0;
+    memcpy((*void)&v, (*void)p, 8);
+    return v;
 }
 
 // Follows the chain from cand looking for a match longer than best at pos.
@@ -512,24 +528,33 @@ int _def_longest(*_Deflate z, uint64 pos, int64 cand, int best, *int64 start) {
     int chain = z.chain;
     if (best >= z.good) chain = chain >> 2;
     int64 lowest = (int64)pos - (int64)_DEF_WSIZE;
-    *uint8 scan = z.src + pos;
+    *uint8 src = z.src;
+    *uint32 prev = z.prev;
+    *uint8 scan = src + pos;
+    int64 found = -1;
     int64 c = cand;
+    uint8 s0 = scan[0];
+    uint8 s1 = scan[1];
+    uint8 e0 = scan[best - 1];
+    uint8 e1 = scan[best];
     while (c >= 0 && c >= lowest && chain > 0) {
         chain--;
-        *uint8 m = z.src + c;
-        if (m[best] == scan[best] && m[best - 1] == scan[best - 1] && m[0] == scan[0] && m[1] == scan[1]) {
+        *uint8 m = src + c;
+        if (m[best] == e1 && m[best - 1] == e0 && m[0] == s0 && m[1] == s1) {
             int l = 2;
+            while (maxlen - l >= 8 && _def_load64(m + l) == _def_load64(scan + l)) l += 8;
             while (l < maxlen && m[l] == scan[l]) l++;
             if (l > best) {
                 best = l;
-                *start = c;
+                found = c;
                 if (l >= nice) break;
+                e0 = scan[best - 1];
+                e1 = scan[best];
             }
         }
-        int64 nx = z.prev[(int)(c & (int64)_DEF_WMASK)] - 1;
-        if (nx >= c) break;
-        c = nx;
+        c = _def_back(c, prev[(int)(c & (int64)_DEF_WMASK)]);
     }
+    if (found >= 0) *start = found;
     return best;
 }
 
@@ -626,8 +651,8 @@ Result<int, string> deflate_raw_append(*uint8 src, uint64 len, int level, Bytes*
     z.lazy = _DEF_LAZY[lv];
     z.nice = _DEF_NICE[lv];
     z.chain = _DEF_CHAIN[lv];
-    z.head = alloc<int64>(1 << _DEF_HBITS);
-    z.prev = alloc<int64>(_DEF_WSIZE);
+    z.head = alloc<uint32>(1 << _DEF_HBITS);
+    z.prev = alloc<uint32>(_DEF_WSIZE);
     z.slit = alloc<uint16>(_DEF_SYMS);
     z.sdist = alloc<uint16>(_DEF_SYMS);
     defer free((*void)z.head);
