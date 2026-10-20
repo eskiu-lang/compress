@@ -1,0 +1,56 @@
+// Compression ratio and speed of <compress/deflate> and <compress/inflate> on
+// a file, at each level given (all of 0 to 9 by default). Each time is the
+// best of three runs. Compare with tools/bench.py, the same with Python's zlib:
+//
+//     eskiuc -O2 tools/bench.esk -o build/bench && build/bench FILE 1 6 9
+import <io>;
+import <fs>;
+import <mem>;
+import <time>;
+import <libc>;
+import <compress/deflate>;
+import <compress/inflate>;
+
+int main(int argc, string* argv) {
+    if (argc < 2) {
+        printf("usage: bench FILE [LEVEL...]\n");
+        return 2;
+    }
+    int64 n = 0;
+    *uint8 src = fs_read_all(argv[1], &n);
+    if (src == null) {
+        printf("cannot read %s\n", argv[1]);
+        return 1;
+    }
+    defer free((*void)src);
+    int nlv = argc > 2 ? argc - 2 : 10;
+    for (k in 0..nlv) {
+        int lv = argc > 2 ? atoi(argv[2 + k]) : k;
+        int64 best_c = (int64)1 << 40;
+        int64 best_d = (int64)1 << 40;
+        int64 size = 0;
+        for (rep in 0..3) {
+            int64 t0 = time_monotonic_ms();
+            Result<Bytes, string> c = deflate_raw(src, (uint64)n, lv);
+            int64 t1 = time_monotonic_ms();
+            if (!c.ok) {
+                printf("deflate: %s\n", c.error);
+                return 1;
+            }
+            Bytes cb = c.value;
+            Result<Bytes, string> d = inflate_raw(cb.data, (uint64)cb.len);
+            int64 t2 = time_monotonic_ms();
+            if (!d.ok || d.value.len != n || memcmp((*void)d.value.data, (*void)src, n) != 0) {
+                printf("level %d: round trip failed\n", lv);
+                return 1;
+            }
+            size = cb.len;
+            if (t1 - t0 < best_c) best_c = t1 - t0;
+            if (t2 - t1 < best_d) best_d = t2 - t1;
+            cb.free();
+            d.value.free();
+        }
+        printf("level %d: %lld -> %lld (%.2f%%)  deflate %lld ms  inflate %lld ms\n", lv, n, size, 100.0 * (double)size / (double)n, best_c, best_d);
+    }
+    return 0;
+}
