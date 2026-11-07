@@ -178,6 +178,8 @@ Then `import <compress>;`, or only the module you need.
 Compressed and decompressed data comes back in a `Bytes` from the standard library's
 `<bytes>`, which the caller frees. Levels outside 0 to 9 are clamped.
 
+Every public function and type, with its documentation, is in the [API reference](docs/api.md).
+
 ## Contributing
 
 Bug reports are welcome; please include the input that fails, if you can share it, and the
