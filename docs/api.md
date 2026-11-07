@@ -31,7 +31,6 @@ returned by the previous call, so data can be checked in pieces:
 ```eskiu
 uint32 c = crc32(data, n);
 uint32 d = crc32_update(crc32_update(0, data, 10), data + 10, n - 10);   // c == d
-
 ```
 
 The incremental forms start from 0 for CRC-32 and 1 for Adler-32, as zlib's
@@ -101,7 +100,6 @@ matching). The window is the full 32 KB.
 ```eskiu
 Bytes comp = deflate_raw(data, n, 6)?;
 defer comp.free();
-
 ```
 
 The matches are collected into blocks of 16384 symbols. Each block is
@@ -176,7 +174,6 @@ Bytes gz = gzip_compress(data, n, 6)?;
 GzipOptions o = GzipOptions{level: 9, name: "notes.txt", mtime: 1700000000};
 Bytes named = gzip_compress_with(data, n, &o)?;
 Bytes back = gzip_decompress(gz.data, (uint64)gz.len)?;
-
 ```
 
 Decompression joins every member of a multi-member file (what `cat a.gz
@@ -287,7 +284,6 @@ not fit:
 Bytes out = inflate_raw(src, n)?;
 defer out.free();
 uint64 got = inflate_raw_into(src, n, dst, cap)?;
-
 ```
 
 Every read of the input is bounds checked; reading past the end feeds zero
@@ -358,7 +354,6 @@ defer w.free();
 w.add_dir("docs");
 w.add("docs/readme.txt", (*uint8)text, strlen(text), 6)?;
 w.finish_file("out.zip")?;
-
 ```
 
 The reader takes the entry list from the central directory and checks each
@@ -598,7 +593,6 @@ Bytes z = zlib_compress(data, n, 6)?;
 defer z.free();
 Bytes back = zlib_decompress(z.data, (uint64)z.len)?;
 defer back.free();
-
 ```
 
 Decompression checks the header and the Adler-32 and stops at the end of
