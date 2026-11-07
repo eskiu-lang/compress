@@ -19,6 +19,8 @@ import <compress/checksum>;
 import <compress/inflate>;
 import <compress/deflate>;
 
+// The operating system byte gzip_compress writes in the header: unknown, so the output
+// does not depend on the machine.
 const int GZIP_OS_UNKNOWN = 255;
 
 // What gzip_compress_with writes into the header: name (or null for none)
@@ -42,6 +44,7 @@ struct GzipHeader {
     uint64 size;
 }
 
+// Frees the header's name and comment.
 void GzipHeader_free(GzipHeader* self) {
     String_free(&self.name);
     String_free(&self.comment);

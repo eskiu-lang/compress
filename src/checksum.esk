@@ -13,7 +13,9 @@
 
 import <atomic>;
 
+// The value crc32_update starts from for the first piece.
 const uint32 CRC32_INIT = 0;
+// The value adler32_update starts from for the first piece.
 const uint32 ADLER32_INIT = 1;
 
 uint32[2048] _crc_tab;
@@ -63,6 +65,7 @@ uint32 crc32_update(uint32 crc, *uint8 p, uint64 n) {
     return ~c;
 }
 
+// The CRC-32 (zlib's, as in gzip and zip) of n bytes at p.
 uint32 crc32(*uint8 p, uint64 n) {
     return crc32_update(0, p, n);
 }
@@ -99,6 +102,7 @@ uint32 adler32_update(uint32 adler, *uint8 p, uint64 n) {
     return (b << 16) | a;
 }
 
+// The Adler-32 (as in zlib streams) of n bytes at p.
 uint32 adler32(*uint8 p, uint64 n) {
     return adler32_update(1, p, n);
 }

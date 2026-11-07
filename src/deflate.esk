@@ -17,9 +17,13 @@ import <bytes>;
 import <result>;
 import <atomic>;
 
+// Level 0: the data stored in stored blocks, not compressed.
 const int DEFLATE_STORE = 0;
+// Level 1: the fastest compression.
 const int DEFLATE_FAST = 1;
+// Level 6: zlib's default trade between speed and size.
 const int DEFLATE_DEFAULT = 6;
+// Level 9: the smallest output, slowest.
 const int DEFLATE_BEST = 9;
 
 // zlib's configuration table: chains shorten below a match of `good`, lazy

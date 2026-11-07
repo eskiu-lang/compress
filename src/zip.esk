@@ -37,9 +37,16 @@ import <compress/checksum>;
 import <compress/inflate>;
 import <compress/deflate>;
 
+// An entry stored as it is (compression method 0).
 const int ZIP_STORED = 0;
+// An entry compressed with deflate (compression method 8).
 const int ZIP_DEFLATED = 8;
 
+// An entry of the archive from the central directory: its name (directories end in /),
+// compression method, general-purpose flags, CRC-32, compressed and uncompressed sizes,
+// modification time (Unix seconds), external attributes (Unix mode in the high 16 bits
+// when the archive comes from Unix), the offset of its local header and whether it is a
+// directory.
 struct ZipEntry {
     String name;
     int method;
@@ -53,6 +60,8 @@ struct ZipEntry {
     bool is_dir;
 }
 
+// An open archive: the bytes (owned when read from a file), the entries, and the most
+// bytes one entry may decompress to (limit).
 struct ZipReader {
     *uint8 data;
     uint64 len;
@@ -160,6 +169,7 @@ void _zip_unix_to_dos(int64 t, *int dtime, *int ddate) {
 
 // ---- reader ----
 
+// Frees the entries and, when the reader read the file itself, the archive's bytes.
 void ZipReader_close(ZipReader* self) {
     for (i in 0..self.entries.size) String_free(&self.entries.data[i].name);
     if (self.entries.data != null) List_free<ZipEntry>(&self.entries);
@@ -169,10 +179,12 @@ void ZipReader_close(ZipReader* self) {
     self.owned = false;
 }
 
+// The number of entries.
 int ZipReader_count(ZipReader* self) {
     return self.entries.size;
 }
 
+// Entry i (0 to count - 1).
 ZipEntry* ZipReader_entry(ZipReader* self, int i) {
     return &self.entries.data[i];
 }
@@ -442,6 +454,7 @@ Result<int, string> ZipReader_extract_all(ZipReader* self, string dir) {
 
 // ---- writer ----
 
+// An empty archive in memory; add entries, then finish or finish_file.
 ZipWriter ZipWriter_new() {
     let w: ZipWriter;
     w.out.init(1024);
@@ -450,6 +463,7 @@ ZipWriter ZipWriter_new() {
     return w;
 }
 
+// Frees the writer and what it holds.
 void ZipWriter_free(ZipWriter* self) {
     for (i in 0..self.entries.size) String_free(&self.entries.data[i].name);
     if (self.entries.data != null) List_free<_ZipCentral>(&self.entries);
